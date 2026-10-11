@@ -558,6 +558,36 @@ LOG:  Grand total: 1651920 bytes in 201 blocks; 622360 free (88 chunks); 1029560
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>pg_pagestore_merge</primary>
+        </indexterm>
+        <function>pg_pagestore_merge</function> (
+          <optional> <parameter>max_layers</parameter> <type>integer</type>
+          </optional> )
+        <returnvalue>record</returnvalue>
+        ( <parameter>merged_layers</parameter> <type>integer</type>,
+        <parameter>written_bytes</parameter> <type>bigint</type> )
+       </para>
+       <para>
+        Merges adjacent frozen page store layers, each pair into a new layer,
+        until there are at most <parameter>max_layers</parameter> of them, or
+        <xref linkend="guc-pagestore-max-frozen-layers"/> if it is omitted.
+        Each <function>pg_branch</function> after writes adds a frozen layer,
+        and reading a block looks through them.  Files of relations that only
+        one layer of a pair has are linked into the new layer as they are;
+        only relations both have are written, starting from a copy-on-write
+        clone where the file system supports it.  Branches keep the layers
+        they share.  A background worker merges layers the same way when
+        there are more than <varname>pagestore_max_frozen_layers</varname>.
+       </para>
+       <para>
+        This function is restricted to superusers by default, but other users
+        can be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>pg_switch_wal</primary>
         </indexterm>
         <function>pg_switch_wal</function> ()

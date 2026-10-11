@@ -177,9 +177,22 @@ opendir(my $dh, $source_layer) or die "could not open layer: $!";
 my @common = grep { !/^\./ && -e "$branch_layer/$_" } readdir($dh);
 closedir($dh);
 ok(@common > 100, 'branch shares the frozen layer (' . scalar(@common) . ' files)');
-my @differ = grep {
-	slurp_file("$branch_layer/$_") ne slurp_file("$source_layer/$_")
-} @common;
+# Either copy may have punched out blocks it no longer reads, which then
+# read as zeroes; blocks both still have must be the same.
+sub same_blocks
+{
+	my ($a, $b) = map { slurp_file($_) } @_;
+	return 0 if length($a) != length($b);
+	my $zero = "\0" x 8192;
+	for (my $off = 0; $off < length($a); $off += 8192)
+	{
+		my ($x, $y) = (substr($a, $off, 8192), substr($b, $off, 8192));
+		return 0 if $x ne $y && $x ne $zero && $y ne $zero;
+	}
+	return 1;
+}
+my @differ =
+  grep { !same_blocks("$branch_layer/$_", "$source_layer/$_") } @common;
 is_deeply(\@differ, [], 'with the same contents');
 if ($^O ne 'darwin')
 {
@@ -315,5 +328,91 @@ $el->safe_psql('postgres', 'CHECKPOINT');
 $el->restart;
 is($el->safe_psql('postgres', "SELECT to_regclass('e') IS NULL"),
 	't', 'checkpoint and restart after removing a layer');
+
+# Merging frozen layers
+my $mg = PostgreSQL::Test::Cluster->new('merge');
+$mg->init(extra => ['--pagestore']);
+$mg->append_conf('postgresql.conf', 'pagestore_max_frozen_layers = 0');
+$mg->start;
+$mg->safe_psql(
+	'postgres', q{
+	CREATE EXTENSION amcheck;
+	CREATE TABLE m (id int PRIMARY KEY, n int);
+	INSERT INTO m SELECT g, 0 FROM generate_series(1, 50000) g;
+	});
+
+sub check_m
+{
+	my ($node, $rounds, $name) = @_;
+	my $expect = join '|', 50000, map { $_ * 100 } 1 .. $rounds;
+	my $got = $node->safe_psql('postgres',
+		'SELECT (SELECT count(*) FROM m WHERE n = (SELECT max(n) FROM m))'
+		  . join('', map { ", (SELECT count(*) FROM t$_)" } 1 .. $rounds));
+	is($got, $expect, "$name: tables intact");
+	$node->safe_psql('postgres', "SELECT bt_index_check('m_pkey', true)");
+}
+
+# Each round updates every row of m, and makes a table, between branches
+my $kept;
+for my $round (1 .. 6)
+{
+	$mg->safe_psql('postgres',
+		"UPDATE m SET n = $round; CREATE TABLE t$round AS SELECT generate_series(1, $round * 100)"
+	);
+	my ($b) = branch($mg, "merge_b$round");
+	if ($round == 3)
+	{
+		$kept = $b;
+	}
+	else
+	{
+		$b->stop;
+		rmtree($b->data_dir);
+	}
+}
+my @before = split ' ', slurp_file($mg->data_dir . '/pg_pagestore/STACK');
+
+my ($merged) = split /\|/,
+  $mg->safe_psql('postgres', 'SELECT merged_layers FROM pg_pagestore_merge(1)');
+my @after = split ' ', slurp_file($mg->data_dir . '/pg_pagestore/STACK');
+is(scalar(@after), 2, "merging leaves one frozen layer below the top");
+is($merged, scalar(@before) - 2, "merged $merged pairs of layers");
+check_m($mg, 6, 'source after merging');
+check_m($kept, 3, 'branch kept from before merging');
+
+my ($post) = branch($mg, 'merge_after');
+check_m($post, 6, 'branch taken after merging');
+
+$mg->restart;
+check_m($mg, 6, 'source after merging and restart');
+$mg->safe_psql('postgres', 'UPDATE m SET n = 6');
+$mg->kill9;
+$mg->start;
+check_m($mg, 6, 'source after merging and a crash');
+
+# A layer directory the stack doesn't list is what a crash left of a merge
+my $orphan = $mg->data_dir . '/pg_pagestore/4000000000';
+mkdir $orphan or die "could not create $orphan: $!";
+append_to_file("$orphan/1663_5_1_main", 'x');
+$mg->restart;
+ok(!-e $orphan, 'layers left out of the stack are removed at startup');
+
+# The merger keeps the number of frozen layers down by itself
+$mg->append_conf('postgresql.conf', 'pagestore_max_frozen_layers = 2');
+$mg->reload;
+$log_offset = -s $mg->logfile;
+for my $round (1 .. 4)
+{
+	$mg->safe_psql('postgres', "UPDATE m SET n = 6 WHERE id <= $round * 1000");
+	my ($b) = branch($mg, "merge_w$round");
+	$b->stop;
+	rmtree($b->data_dir);
+}
+$mg->wait_for_log(qr/page store merged/, $log_offset);
+$mg->poll_query_until('postgres',
+	"SELECT (SELECT count(*) FROM pg_ls_dir('pg_pagestore') d WHERE d ~ '^[0-9]+\$') <= 3"
+) or die "the merger did not merge down to 2 frozen layers";
+pass('the merger merges in the background');
+check_m($mg, 6, 'source after the merger merged');
 
 done_testing();

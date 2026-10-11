@@ -113,6 +113,7 @@
 #include "storage/fd.h"
 #include "storage/io_worker.h"
 #include "storage/ipc.h"
+#include "storage/pagestore.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/shmem_internal.h"
@@ -923,6 +924,9 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/* Register the page store merger, if the cluster uses the page store */
+	PageStoreMergerRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

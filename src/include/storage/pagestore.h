@@ -38,6 +38,7 @@
 extern PGDLLIMPORT int pagestore_max_forks;
 extern PGDLLIMPORT int pagestore_max_bitmap_chunks;
 extern PGDLLIMPORT bool pagestore_reclaim;
+extern PGDLLIMPORT int pagestore_max_frozen_layers;
 
 /* What PageStoreReclaim() gave back */
 typedef struct PageStoreReclaimResult
@@ -109,5 +110,18 @@ extern XLogRecPtr PageStoreGetBranchKeepLSN(void);
 /* reclaiming space of frozen layers */
 extern bool PageStoreReclaim(PageStoreReclaimResult *result, bool wait);
 extern void PageStoreReclaimAfterCheckpoint(void);
+
+/* What PageStoreMerge() did */
+typedef struct PageStoreMergeResult
+{
+	int			merged_layers;	/* pairs of layers merged into one */
+	int64		written_bytes;	/* data written for forks both had */
+} PageStoreMergeResult;
+
+/* merging frozen layers */
+extern bool PageStoreMerge(int max_frozen, bool wait,
+						   PageStoreMergeResult *result);
+extern void PageStoreMergerRegister(void);
+pg_noreturn extern void PageStoreMergerMain(Datum main_arg);
 
 #endif							/* PAGESTORE_H */
