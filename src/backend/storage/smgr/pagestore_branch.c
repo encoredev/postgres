@@ -350,7 +350,9 @@ branch_link_layers(const char *target, const uint32 *layers, int nlayers)
 	}
 
 	/* the branch writes into a layer of its own */
-	stack[nlayers] = nlayers > 0 ? layers[nlayers - 1] + 1 : 1;
+	stack[nlayers] = 1;
+	for (int i = 0; i < nlayers; i++)
+		stack[nlayers] = Max(stack[nlayers], layers[i] + 1);
 	snprintf(path, sizeof(path), "%s/%s/%u", target, PAGESTORE_DIR,
 			 stack[nlayers]);
 	branch_mkdir(path);
@@ -710,6 +712,48 @@ pg_pagestore_reclaim(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum(result.removed_files);
 	values[1] = Int32GetDatum(result.removed_layers);
 	values[2] = Int64GetDatum(result.reclaimed_bytes);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
+													  values, nulls)));
+}
+
+/*
+ * pg_pagestore_merge(max_layers int) returns record
+ *
+ * Merge adjacent frozen page store layers until there are at most
+ * max_layers of them, or pagestore_max_frozen_layers if that's NULL.  The
+ * page store merger does the same in the background.
+ */
+Datum
+pg_pagestore_merge(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {false};
+	int			max_layers;
+	PageStoreMergeResult result;
+
+	if (!PageStoreEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the cluster does not use the page store")));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	max_layers = PG_ARGISNULL(0) ? pagestore_max_frozen_layers : PG_GETARG_INT32(0);
+	if (max_layers < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("max_layers must be at least 1")));
+
+	(void) PageStoreMerge(max_layers, true, &result);
+
+	values[0] = Int32GetDatum(result.merged_layers);
+	values[1] = Int64GetDatum(result.written_bytes);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
 													  values, nulls)));

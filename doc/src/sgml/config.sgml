@@ -2566,6 +2566,27 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-pagestore-max-frozen-layers" xreflabel="pagestore_max_frozen_layers">
+      <term><varname>pagestore_max_frozen_layers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>pagestore_max_frozen_layers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the number of frozen page store layers above which the page
+        store merger, a background worker, merges adjacent layers as
+        <function>pg_pagestore_merge</function> does.  Reading a block may
+        look through every frozen layer, so fewer layers make reads cheaper,
+        at the cost of writing out the relations that adjacent layers both
+        have.  Zero turns off merging in the background.  The default is 8.
+        This parameter can only be set in the
+        <filename>postgresql.conf</filename> file or on the server command
+        line.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-pagestore-reclaim" xreflabel="pagestore_reclaim">
       <term><varname>pagestore_reclaim</varname> (<type>boolean</type>)
       <indexterm>

@@ -34,7 +34,9 @@ The files in this directory, and their contents, are
     pagestore.c	A copy-on-write storage manager, used instead of md.c for
 		permanent relations in pg_default and pg_global by a cluster
 		created with initdb --pagestore.  It keeps relations as stacks
-		of layers, so that a frozen layer can be shared.
+		of layers, so that a frozen layer can be shared.  Space that
+		frozen layers no longer need is reclaimed after checkpoints,
+		and a background worker merges adjacent frozen layers.
 
     pagestore_branch.c	pg_branch(), which copies a cluster that uses the
 		page store by sharing its frozen layers.

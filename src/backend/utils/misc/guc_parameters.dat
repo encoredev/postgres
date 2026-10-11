@@ -2334,6 +2334,15 @@
   max => 'INT_MAX / 2',
 },
 
+{ name => 'pagestore_max_frozen_layers', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_DISK',
+  short_desc => 'Sets the number of frozen page store layers above which the merger merges them.',
+  long_desc => '0 turns off merging in the background.',
+  variable => 'pagestore_max_frozen_layers',
+  boot_val => '8',
+  min => '0',
+  max => '255',
+},
+
 { name => 'pagestore_reclaim', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_DISK',
   short_desc => 'Gives back the space of frozen page store layers after checkpoints.',
   variable => 'pagestore_reclaim',
