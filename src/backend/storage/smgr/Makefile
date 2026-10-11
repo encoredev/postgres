@@ -15,6 +15,8 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	bulk_write.o \
 	md.o \
+	pagestore.o \
+	pagestore_branch.o \
 	smgr.o
 
 include $(top_srcdir)/src/backend/common.mk

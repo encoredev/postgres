@@ -22,6 +22,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/pagestore.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -141,6 +142,7 @@ calculate_database_size(Oid dbOid)
 	/* Include pg_default storage */
 	snprintf(pathname, sizeof(pathname), "base/%u", dbOid);
 	totalsize = db_dir_size(pathname);
+	totalsize += PageStoreDatabaseSize(dbOid);
 
 	/* Scan the non-default tablespaces */
 	snprintf(dirpath, MAXPGPATH, PG_TBLSPC_DIR);
@@ -329,6 +331,9 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	RelPathStr	relationpath;
 	char		pathname[MAXPGPATH];
 	unsigned int segcount = 0;
+
+	if (PageStoreHandlesRelation(*rfn, backend))
+		return PageStoreForkSize(*rfn, forknum);
 
 	relationpath = relpathbackend(*rfn, backend, forknum);
 

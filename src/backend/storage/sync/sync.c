@@ -29,6 +29,7 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#include "storage/pagestore.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -115,6 +116,12 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+	/* copy-on-write page store */
+	[SYNC_HANDLER_PAGESTORE] = {
+		.sync_syncfiletag = pssyncfiletag,
+		.sync_unlinkfiletag = psunlinkfiletag,
+		.sync_filetagmatches = psfiletagmatches
 	}
 };
 
