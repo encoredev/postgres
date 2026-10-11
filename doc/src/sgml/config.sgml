@@ -2532,6 +2532,58 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-pagestore-max-forks" xreflabel="pagestore_max_forks">
+      <term><varname>pagestore_max_forks</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>pagestore_max_forks</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the number of relation forks the page store (see
+        <xref linkend="app-initdb-option-pagestore"/>) can have written to
+        since its layers were last frozen.  The default is 65536.  This
+        parameter can only be set at server start, and only takes memory in
+        a cluster that uses the page store.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-pagestore-max-bitmap-chunks" xreflabel="pagestore_max_bitmap_chunks">
+      <term><varname>pagestore_max_bitmap_chunks</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>pagestore_max_bitmap_chunks</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the number of 1 kB bitmap chunks the page store can use to track
+        which blocks of relations shared with frozen layers have been written
+        to since.  Each chunk covers 8192 blocks of one relation fork.  The
+        default is 16384.  This parameter can only be set at server start,
+        and only takes memory in a cluster that uses the page store.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-pagestore-reclaim" xreflabel="pagestore_reclaim">
+      <term><varname>pagestore_reclaim</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>pagestore_reclaim</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Makes the checkpointer give back the disk space of page store layers
+        the cluster can no longer read after checkpoints, as
+        <function>pg_pagestore_reclaim</function> does.  The default is
+        <literal>on</literal>.  This parameter can only be set in the
+        <filename>postgresql.conf</filename> file or on the server command
+        line.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-max-notify-queue-pages" xreflabel="max_notify_queue_pages">
       <term><varname>max_notify_queue_pages</varname> (<type>integer</type>)
       <indexterm>

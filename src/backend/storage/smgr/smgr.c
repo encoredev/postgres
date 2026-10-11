@@ -70,6 +70,7 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/pagestore.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -122,7 +123,7 @@ typedef struct f_smgr
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
-	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
+	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint64 *off);
 } f_smgr;
 
 static const f_smgr smgrsw[] = {
@@ -148,6 +149,29 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+	},
+	/* copy-on-write page store, see pagestore.c */
+	{
+		.smgr_init = psinit,
+		.smgr_shutdown = NULL,
+		.smgr_open = psopen,
+		.smgr_close = psclose,
+		.smgr_create = pscreate,
+		.smgr_exists = psexists,
+		.smgr_unlink = psunlink,
+		.smgr_extend = psextend,
+		.smgr_zeroextend = pszeroextend,
+		.smgr_prefetch = psprefetch,
+		.smgr_maxcombine = psmaxcombine,
+		.smgr_readv = psreadv,
+		.smgr_startreadv = psstartreadv,
+		.smgr_writev = pswritev,
+		.smgr_writeback = pswriteback,
+		.smgr_nblocks = psnblocks,
+		.smgr_truncate = pstruncate,
+		.smgr_immedsync = psimmedsync,
+		.smgr_registersync = psregistersync,
+		.smgr_fd = psfd,
 	}
 };
 
@@ -273,7 +297,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = PageStoreHandlesRelation(rlocator, backend) ? 1 : 0;
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -986,7 +1010,7 @@ smgrimmedsync(SMgrRelation reln, ForkNumber forknum)
  * process than where it was issued (e.g. in an IO worker).
  */
 static int
-smgrfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+smgrfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint64 *off)
 {
 	int			fd;
 
@@ -1067,7 +1091,7 @@ smgr_aio_reopen(PgAioHandle *ioh)
 	PgAioOpData *od = pgaio_io_get_op_data(ioh);
 	SMgrRelation reln;
 	ProcNumber	procno;
-	uint32		off;
+	uint64		off;
 
 	/*
 	 * The caller needs to prevent interrupts from being processed, otherwise

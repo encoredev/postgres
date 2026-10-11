@@ -2118,6 +2118,7 @@ PageData
 PageGistNSN
 PageHeader
 PageHeaderData
+PageStoreReclaimResult
 PageXLogRecPtr
 PagetableEntry
 Pairs
@@ -2427,6 +2428,17 @@ PruneFreezeResult
 PruneReason
 PruneState
 PruneStepResult
+PsChunk
+PsChunkKey
+PsDeadFork
+PsForkKey
+PsForkKind
+PsFrozenFork
+PsFrozenKey
+PsMapHeader
+PsOpenFile
+PsShared
+PsTopFork
 PsqlScanCallbacks
 PsqlScanQuoteType
 PsqlScanResult

@@ -60,6 +60,7 @@
 #include "storage/lmgr.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
+#include "storage/pagestore.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
@@ -619,6 +620,10 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 		 * We don't need to copy subdirectories
 		 */
 		copydir(srcpath, dstpath, false);
+
+		/* The page store keeps pg_default's relations elsewhere */
+		if (srctablespace == DEFAULTTABLESPACE_OID)
+			PageStoreCopyDatabase(src_dboid, dst_dboid, dsttablespace, false);
 
 		/* Record the filesystem change in XLOG */
 		{
@@ -2037,6 +2042,12 @@ movedb(const char *dbname, const char *tblspcname)
 	struct dirent *xlde;
 	movedb_failure_params fparms;
 
+	/* Moving would have to copy relations in and out of the page store */
+	if (PageStoreEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change the tablespace of a database in a cluster that uses the page store")));
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this to ensure that no new backend starts up in the database while
@@ -3030,6 +3041,9 @@ remove_dbtablespaces(Oid db_id)
 	int			i;
 	Oid		   *tablespace_ids;
 
+	/* The page store keeps pg_default's relations elsewhere */
+	PageStoreDropDatabase(db_id);
+
 	rel = table_open(TableSpaceRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(rel, 0, NULL);
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
@@ -3377,6 +3391,13 @@ dbase_redo(XLogReaderState *record)
 		 */
 		copydir(src_path, dst_path, false);
 
+		if (xlrec->src_tablespace_id == DEFAULTTABLESPACE_OID)
+		{
+			PageStoreDropDatabase(xlrec->db_id);
+			PageStoreCopyDatabase(xlrec->src_db_id, xlrec->db_id,
+								  xlrec->tablespace_id, true);
+		}
+
 		pfree(src_path);
 		pfree(dst_path);
 	}
@@ -3436,6 +3457,8 @@ dbase_redo(XLogReaderState *record)
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+
+		PageStoreDropDatabase(xlrec->db_id);
 
 		for (i = 0; i < xlrec->ntablespaces; i++)
 		{

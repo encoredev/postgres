@@ -36,6 +36,7 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/md.h"
+#include "storage/pagestore.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
@@ -1492,7 +1493,7 @@ mdimmedsync(SMgrRelation reln, ForkNumber forknum)
 }
 
 int
-mdfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+mdfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint64 *off)
 {
 	MdfdVec    *v = mdopenfork(reln, forknum, EXTENSION_FAIL);
 
@@ -1603,6 +1604,8 @@ ForgetDatabaseSyncRequests(Oid dbid)
 	INIT_MD_FILETAG(tag, rlocator, InvalidForkNumber, InvalidBlockNumber);
 
 	RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true /* retryOnError */ );
+
+	PageStoreForgetDatabaseSyncRequests(dbid);
 }
 
 /*
