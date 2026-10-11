@@ -3,5 +3,7 @@
 backend_sources += files(
   'bulk_write.c',
   'md.c',
+  'pagestore.c',
+  'pagestore_branch.c',
   'smgr.c',
 )

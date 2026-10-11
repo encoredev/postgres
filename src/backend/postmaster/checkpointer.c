@@ -57,6 +57,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/pagestore.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
@@ -558,6 +559,14 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 			}
 
 			ckpt_active = false;
+
+			/*
+			 * A checkpoint is a good time to give back the page store's
+			 * space.  Waiters know the checkpoint is done, so a failure here
+			 * isn't reported as the checkpoint's.
+			 */
+			if (!do_restartpoint && ckpt_performed)
+				PageStoreReclaimAfterCheckpoint();
 
 			/*
 			 * We may have received an interrupt during the checkpoint and the

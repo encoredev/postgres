@@ -31,6 +31,14 @@ The files in this directory, and their contents, are
     md.c	The "magnetic disk" storage manager, which is really just
 		an interface to the kernel's filesystem operations.
 
+    pagestore.c	A copy-on-write storage manager, used instead of md.c for
+		permanent relations in pg_default and pg_global by a cluster
+		created with initdb --pagestore.  It keeps relations as stacks
+		of layers, so that a frozen layer can be shared.
+
+    pagestore_branch.c	pg_branch(), which copies a cluster that uses the
+		page store by sharing its frozen layers.
+
 Note that md.c in turn relies on src/backend/storage/file/fd.c.
 
 

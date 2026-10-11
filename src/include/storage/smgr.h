@@ -61,6 +61,10 @@ typedef struct SMgrRelationData
 	int			md_num_open_segs[MAX_FORKNUM + 1];
 	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
 
+	/* for pagestore.c: per-fork open files, one per layer read or written */
+	int			ps_num_files[MAX_FORKNUM + 1];
+	struct PsOpenFile *ps_files[MAX_FORKNUM + 1];
+
 	/*
 	 * Pinning support.  If unpinned (ie. pincount == 0), 'node' is a list
 	 * link in list of all unpinned SMgrRelations.

@@ -567,6 +567,27 @@ PostgreSQL documentation
       </listitem>
      </varlistentry>
 
+     <varlistentry id="app-initdb-option-pagestore">
+      <term><option>--pagestore</option></term>
+      <listitem>
+       <para>
+        Keep relations in <literal>pg_default</literal> and
+        <literal>pg_global</literal> in a copy-on-write page store, in the
+        <filename>pg_pagestore</filename> subdirectory, instead of one file
+        per relation fork.  A cluster using the page store can be copied while
+        it runs, in time independent of its size, with
+        <function>pg_branch</function> (see
+        <xref linkend="functions-admin-backup-table"/>).
+       </para>
+       <para>
+        Such a cluster can't change a database's tablespace, and tools that
+        read relation files directly, such as <application>pg_rewind</application>,
+        <application>pg_checksums</application> and
+        <application>pg_upgrade</application>, don't support it.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="app-initdb-option-show">
       <term><option>-s</option></term>
       <term><option>--show</option></term>

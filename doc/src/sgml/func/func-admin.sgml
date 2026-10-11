@@ -493,6 +493,71 @@ LOG:  Grand total: 1651920 bytes in 201 blocks; 622360 free (88 chunks); 1029560
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>pg_branch</primary>
+        </indexterm>
+        <function>pg_branch</function> (
+          <parameter>target</parameter> <type>text</type>
+          <optional>, <parameter>checkpoint</parameter> <type>boolean</type>
+          </optional> )
+        <returnvalue>pg_lsn</returnvalue>
+       </para>
+       <para>
+        Copies the cluster into a new data directory, <parameter>target</parameter>,
+        without interrupting it, and returns the write-ahead log location the
+        copy is consistent as of.  The cluster must have been created with
+        <command>initdb --pagestore</command>, and must use data checksums or
+        <xref linkend="guc-wal-log-hints"/>.  Relation data is not copied: the
+        copy shares the page store's layers, by hard link or by copy-on-write
+        clone, so <parameter>target</parameter> must be an absolute path on
+        the same file system as the data directory, and must not exist.
+       </para>
+       <para>
+        Starting a server on the copy runs crash recovery up to the returned
+        location: transactions that had not committed by then are rolled
+        back, and unlogged tables are empty.  The copy has the same
+        configuration, including <varname>port</varname>, which needs changing
+        before both servers can run.  Unless <parameter>checkpoint</parameter>
+        is <literal>false</literal>, a fast checkpoint is taken first, so that
+        recovery has little write-ahead log to replay.
+       </para>
+       <para>
+        This function is restricted to superusers by default, but other users
+        can be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+         <primary>pg_pagestore_reclaim</primary>
+        </indexterm>
+        <function>pg_pagestore_reclaim</function> ()
+        <returnvalue>record</returnvalue>
+        ( <parameter>removed_files</parameter> <type>bigint</type>,
+        <parameter>removed_layers</parameter> <type>integer</type>,
+        <parameter>reclaimed_bytes</parameter> <type>bigint</type> )
+       </para>
+       <para>
+        Gives back the disk space of page store layers that the cluster can no
+        longer read, because layers frozen later by
+        <function>pg_branch</function> hold newer versions of their blocks, or
+        dropped their relations.  Files holding nothing readable are removed,
+        unreadable blocks of other files are deallocated where the file system
+        supports it, and layers left empty are removed.  Nothing is copied.
+        Files that another data directory shares by hard link keep their
+        blocks until that directory is removed.  The checkpointer does the
+        same after checkpoints, unless <xref linkend="guc-pagestore-reclaim"/>
+        is off.
+       </para>
+       <para>
+        This function is restricted to superusers by default, but other users
+        can be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>pg_switch_wal</primary>
         </indexterm>
         <function>pg_switch_wal</function> ()

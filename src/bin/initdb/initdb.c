@@ -169,6 +169,7 @@ static char *xlog_dir = NULL;
 static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 static bool sync_data_files = true;
+static bool pagestore = false;
 
 
 /* internal vars */
@@ -2531,6 +2532,8 @@ usage(const char *progname)
 	printf(_("      --icu-locale=LOCALE   set ICU locale ID for new databases\n"));
 	printf(_("      --icu-rules=RULES     set additional ICU collation rules for new databases\n"));
 	printf(_("  -k, --data-checksums      use data page checksums\n"));
+	printf(_("      --pagestore           keep relations in a copy-on-write page store,\n"
+			 "                            which pg_branch() can copy in constant time\n"));
 	printf(_("      --locale=LOCALE       set default locale for new databases\n"));
 	printf(_("      --lc-collate=, --lc-ctype=, --lc-messages=LOCALE\n"
 			 "      --lc-monetary=, --lc-numeric=, --lc-time=LOCALE\n"
@@ -3085,6 +3088,30 @@ initialize_data_directory(void)
 		free(path);
 	}
 
+	/* The page store starts with a single, empty layer */
+	if (pagestore)
+	{
+		char	   *path;
+		FILE	   *stack;
+
+		path = psprintf("%s/pg_pagestore", pg_data);
+		if (mkdir(path, pg_dir_create_mode) < 0)
+			pg_fatal("could not create directory \"%s\": %m", path);
+		pfree(path);
+
+		path = psprintf("%s/pg_pagestore/1", pg_data);
+		if (mkdir(path, pg_dir_create_mode) < 0)
+			pg_fatal("could not create directory \"%s\": %m", path);
+		pfree(path);
+
+		path = psprintf("%s/pg_pagestore/STACK", pg_data);
+		if ((stack = fopen(path, PG_BINARY_W)) == NULL)
+			pg_fatal("could not open file \"%s\" for writing: %m", path);
+		if (fprintf(stack, "1\n") < 0 || fclose(stack) != 0)
+			pg_fatal("could not write file \"%s\": %m", path);
+		pfree(path);
+	}
+
 	check_ok();
 
 	/* Top level PG_VERSION is checked by bootstrapper, so make it first */
@@ -3202,6 +3229,7 @@ main(int argc, char *argv[])
 		{"sync-method", required_argument, NULL, 19},
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
+		{"pagestore", no_argument, NULL, 22},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3398,6 +3426,9 @@ main(int argc, char *argv[])
 				break;
 			case 21:
 				sync_data_files = false;
+				break;
+			case 22:
+				pagestore = true;
 				break;
 			default:
 				/* getopt_long already emitted a complaint */

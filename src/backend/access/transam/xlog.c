@@ -88,6 +88,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
+#include "storage/pagestore.h"
 #include "storage/latch.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -4644,6 +4645,17 @@ UpdateControlFile(void)
 }
 
 /*
+ * Copy the control file as of the last completed checkpoint.
+ */
+void
+GetControlFileCopy(ControlFileData *copy)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(copy, ControlFile, sizeof(ControlFileData));
+	LWLockRelease(ControlFileLock);
+}
+
+/*
  * Returns the unique system identifier from control file.
  */
 uint64
@@ -7699,6 +7711,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
 	CheckpointStats.ckpt_sync_t = GetCurrentTimestamp();
 	ProcessSyncRequests();
+	PageStoreCheckPoint();
 	CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();
 
@@ -8152,6 +8165,17 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 			if (currSegNo - segno > slot_keep_segs)
 				segno = currSegNo - slot_keep_segs;
 		}
+	}
+
+	/* Don't remove WAL that pg_branch() is copying */
+	keep = PageStoreGetBranchKeepLSN();
+	if (XLogRecPtrIsValid(keep))
+	{
+		XLogSegNo	branch_segno;
+
+		XLByteToSeg(keep, branch_segno, wal_segment_size);
+		if (branch_segno < segno)
+			segno = branch_segno;
 	}
 
 	/*

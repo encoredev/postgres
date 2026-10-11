@@ -257,6 +257,8 @@ extern XLogRecPtr GetXLogInsertRecPtr(void);
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 
+struct ControlFileData;
+extern void GetControlFileCopy(struct ControlFileData *copy);
 extern uint64 GetSystemIdentifier(void);
 extern char *GetMockAuthenticationNonce(void);
 extern bool DataChecksumsEnabled(void);

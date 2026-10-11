@@ -20,6 +20,7 @@
 #include "postmaster/startup.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
+#include "storage/pagestore.h"
 #include "storage/reinit.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -91,6 +92,9 @@ ResetUnloggedRelations(int op)
 	}
 
 	FreeDir(spc_dir);
+
+	/* Relations in pg_default and pg_global may be in the page store */
+	PageStoreResetUnloggedRelations(op);
 
 	/*
 	 * Restore memory context.

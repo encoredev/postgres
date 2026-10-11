@@ -42,6 +42,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "storage/pagestore.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -609,7 +610,9 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		/* Check for existing file of same name */
 		rpath = relpath(rlocator, MAIN_FORKNUM);
 
-		if (access(rpath.str, F_OK) == 0)
+		if (PageStoreHandlesRelation(rlocator.locator, rlocator.backend) ?
+			PageStoreRelFileNumberInUse(rlocator.locator) :
+			access(rpath.str, F_OK) == 0)
 		{
 			/* definite collision */
 			collides = true;
