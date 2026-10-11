@@ -2118,6 +2118,7 @@ PageData
 PageGistNSN
 PageHeader
 PageHeaderData
+PageStoreMergeResult
 PageStoreReclaimResult
 PageXLogRecPtr
 PagetableEntry

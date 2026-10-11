@@ -197,6 +197,8 @@
                                         # (change requires restart)
 #pagestore_reclaim = on                 # give back space of frozen layers
                                         # after checkpoints
+#pagestore_max_frozen_layers = 8        # merge frozen layers beyond this many,
+                                        # 0 disables
 
 # - Kernel Resources -
 

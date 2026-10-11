@@ -25,6 +25,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/pagestore.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -157,6 +158,10 @@ static const struct
 	{
 		.fn_name = "TableSyncWorkerMain",
 		.fn_addr = TableSyncWorkerMain
+	},
+	{
+		.fn_name = "PageStoreMergerMain",
+		.fn_addr = PageStoreMergerMain
 	}
 };
 
