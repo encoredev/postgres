@@ -92,6 +92,7 @@
 #include "storage/latch.h"
 #include "storage/md.h"
 #include "storage/pagestore.h"
+#include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/reinit.h"
 #include "storage/shmem.h"
@@ -106,12 +107,20 @@ int			pagestore_max_forks = 65536;
 int			pagestore_max_bitmap_chunks = 16384;
 bool		pagestore_reclaim = true;
 int			pagestore_max_frozen_layers = 8;
+bool		pagestore_auto_freeze = true;
 
 #define PS_NUM_PARTITIONS	16
 
 /* A bitmap chunk covers this many blocks */
 #define PS_CHUNK_BLOCKS		8192
 #define PS_CHUNK_WORDS		(PS_CHUNK_BLOCKS / 32)
+
+/*
+ * A fork whose base is this small keeps its bits in its entry rather than in
+ * chunks: most forks are this small, and a chunk would take 1 kB for each.
+ */
+#define PS_SMALL_BLOCKS		256
+#define PS_SMALL_WORDS		(PS_SMALL_BLOCKS / 32)
 
 #define PS_MAP_SUFFIX		".map"
 #define PS_TMP_SUFFIX		".tmp"
@@ -142,6 +151,13 @@ typedef struct PsTopFork
 	bool		unsynced;		/* written since its data file was fsync'd */
 	uint32		map_version;	/* bumped whenever map_dirty is set */
 	BlockNumber base;
+
+	/*
+	 * Whether the bits below base are in small_bits rather than in chunks.
+	 * Set when the entry gets its base, which only shrinks from then on.
+	 */
+	bool		small_bitmap;
+	uint32		small_bits[PS_SMALL_WORDS];
 } PsTopFork;
 
 typedef struct PsChunkKey
@@ -202,6 +218,17 @@ typedef struct PsShared
 
 	/* set while a process removes merged layers' trash */
 	pg_atomic_flag trash_emptying;
+
+	/* entries in PsTopForks, see ps_top_has_room(), and in PsChunks */
+	pg_atomic_uint32 top_forks;
+	pg_atomic_uint32 top_chunks;
+
+	/*
+	 * Set when either passes PS_AUTO_FREEZE_PERCENT, which wakes the page
+	 * store merger to freeze the top layer and so empty them.
+	 */
+	pg_atomic_flag freeze_requested;
+	ProcNumber	merger_procno;
 
 	/*
 	 * CREATE DATABASE ... STRATEGY SNAPSHOT calls waiting for that flag.
@@ -454,6 +481,10 @@ PageStoreShmemInit(void *arg)
 	pg_atomic_init_u64(&PsCtl->branch_keep_lsn, InvalidXLogRecPtr);
 	pg_atomic_init_flag(&PsCtl->reclaim_running);
 	pg_atomic_init_flag(&PsCtl->trash_emptying);
+	pg_atomic_init_u32(&PsCtl->top_forks, 0);
+	pg_atomic_init_u32(&PsCtl->top_chunks, 0);
+	pg_atomic_init_flag(&PsCtl->freeze_requested);
+	PsCtl->merger_procno = INVALID_PROC_NUMBER;
 	pg_atomic_init_u32(&PsCtl->clones_waiting, 0);
 	LWLockInitialize(&PsCtl->freeze_lock, LWTRANCHE_PAGESTORE);
 	LWLockInitialize(&PsCtl->branch_lock, LWTRANCHE_PAGESTORE);
@@ -896,6 +927,110 @@ ps_top_lookup(const PsForkKey *key, uint32 hash)
 													 HASH_FIND, NULL);
 }
 
+/* How full the top layer's tables get before it's frozen to empty them */
+#define PS_AUTO_FREEZE_PERCENT	75
+
+/*
+ * Ask the page store merger to freeze the top layer if one of its tables is
+ * getting full.  Cheap enough to call on every insert.
+ */
+static void
+ps_maybe_request_freeze(uint32 used, int max)
+{
+	ProcNumber	merger;
+
+	if (!pagestore_auto_freeze ||
+		(uint64) used * 100 < (uint64) max * PS_AUTO_FREEZE_PERCENT)
+		return;
+	if (!pg_atomic_test_set_flag(&PsCtl->freeze_requested))
+		return;					/* asked already */
+	merger = PsCtl->merger_procno;
+	if (merger != INVALID_PROC_NUMBER)
+		SetLatch(&GetPGProcByNumber(merger)->procLatch);
+}
+
+/*
+ * Should reclaiming or merging in the background stop early?  When a clone
+ * waits for them, or the top layer is to be frozen, which the merger does
+ * between merges.
+ */
+static inline bool
+ps_background_should_yield(void)
+{
+	return pg_atomic_read_u32(&PsCtl->clones_waiting) > 0 ||
+		!pg_atomic_unlocked_test_flag(&PsCtl->freeze_requested);
+}
+
+/*
+ * Fork entries kept for what can't fail: truncating, which runs in a critical
+ * section, dropping, which runs after commit, and loading the top layer at
+ * startup.  Everything else checks for room with ps_top_has_room() before it
+ * changes anything, and fails without holding locks once only these are
+ * left: a backend that errors while holding a partition lock can't take it
+ * again in its error cleanup, and others queue up behind it.
+ */
+#define PS_RESERVED_FORKS	Max(64, pagestore_max_forks / 64)
+
+/*
+ * Is there room for the fork's top layer entry, if it needs one?  Caller
+ * holds the fork's partition lock.
+ */
+static bool
+ps_top_has_room(const PsForkKey *key, uint32 hash, bool critical)
+{
+	if (critical || ps_top_lookup(key, hash) != NULL)
+		return true;
+	return pg_atomic_read_u32(&PsCtl->top_forks) + PS_RESERVED_FORKS <
+		(uint32) pagestore_max_forks;
+}
+
+/* Report that the top layer is full.  Caller holds no page store lock. */
+static void
+ps_report_full(const char *what, const char *guc)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("out of page store %s", what),
+			 errhint("Freezing the top layer with pg_pagestore_freeze() frees them, or you might need to increase \"%s\".",
+					 guc)));
+}
+
+/*
+ * Make room in the top layer's tables by freezing it, for a write that found
+ * them full: what pagestore_auto_freeze has the merger do earlier, should it
+ * not keep up.  The checkpointer and the startup process always do: a
+ * failed shutdown checkpoint would leave crash recovery for the next start,
+ * and a failed recovery wouldn't start.  Returns false if it can't: auto
+ * freezing is off, this backend holds the branch lock, as a clone copying
+ * does, or it tried a few times already for the same write (*attempts
+ * counts).  Caller holds no other page store lock.
+ */
+static bool
+ps_freeze_for_room(int *attempts)
+{
+	uint32		layers[PAGESTORE_MAX_LAYERS];
+	XLogRecPtr	insert_end;
+
+	if (!(pagestore_auto_freeze || AmCheckpointerProcess() ||
+		  AmStartupProcess()) ||
+		LWLockHeldByMe(&PsCtl->branch_lock) || ++*attempts > 3)
+		return false;
+
+	LWLockAcquire(&PsCtl->branch_lock, LW_EXCLUSIVE);
+	/* unless another backend did meanwhile */
+	if (pg_atomic_read_u32(&PsCtl->top_forks) + PS_RESERVED_FORKS >=
+		(uint32) pagestore_max_forks ||
+		pg_atomic_read_u32(&PsCtl->top_chunks) * 100 >=
+		(uint32) pagestore_max_bitmap_chunks * PS_AUTO_FREEZE_PERCENT)
+	{
+		(void) PageStoreFreeze(layers, &insert_end);
+		ereport(LOG,
+				(errmsg("page store froze its top layer, which was full")));
+	}
+	LWLockRelease(&PsCtl->branch_lock);
+	return true;
+}
+
 static PsTopFork *
 ps_top_insert(const PsForkKey *key, uint32 hash)
 {
@@ -906,20 +1041,32 @@ ps_top_insert(const PsForkKey *key, uint32 hash)
 													HASH_ENTER_NULL, &found);
 	if (top == NULL)
 		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of page store fork entries"),
 				 errhint("You might need to increase \"%s\".",
 						 "pagestore_max_forks")));
 	if (!found)
 	{
+		ps_maybe_request_freeze(pg_atomic_add_fetch_u32(&PsCtl->top_forks, 1),
+								pagestore_max_forks);
 		top->kind = PS_FORK_DATA;
 		top->has_map = false;
 		top->map_dirty = false;
 		top->unsynced = false;
 		top->map_version = 0;
 		top->base = 0;
+		top->small_bitmap = true;
+		memset(top->small_bits, 0, sizeof(top->small_bits));
 	}
 	return top;
+}
+
+/* Give a new entry the base it inherits; see small_bitmap. */
+static void
+ps_top_set_initial_base(PsTopFork *top, BlockNumber base)
+{
+	top->base = base;
+	top->small_bitmap = base <= PS_SMALL_BLOCKS;
 }
 
 static PsChunk *
@@ -938,43 +1085,97 @@ ps_chunk_lookup(const PsForkKey *key, uint32 hash, uint32 chunkno,
 													ps_chunk_hash(hash, chunkno),
 													create ? HASH_ENTER_NULL : HASH_FIND,
 													&found);
-	if (create)
+	if (create && chunk != NULL && !found)
 	{
-		if (chunk == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of page store bitmap chunks"),
-					 errhint("You might need to increase \"%s\".",
-							 "pagestore_max_bitmap_chunks")));
-		if (!found)
-			memset(chunk->bits, 0, sizeof(chunk->bits));
+		memset(chunk->bits, 0, sizeof(chunk->bits));
+		ps_maybe_request_freeze(pg_atomic_add_fetch_u32(&PsCtl->top_chunks, 1),
+								pagestore_max_bitmap_chunks);
 	}
 	return chunk;
 }
 
 static bool
-ps_top_bit(const PsForkKey *key, uint32 hash, BlockNumber blkno)
+ps_top_bit(const PsTopFork *top, uint32 hash, BlockNumber blkno)
 {
-	PsChunk    *chunk = ps_chunk_lookup(key, hash, blkno / PS_CHUNK_BLOCKS, false);
+	PsChunk    *chunk;
 	uint32		off = blkno % PS_CHUNK_BLOCKS;
 
+	if (top->small_bitmap)
+		return blkno < PS_SMALL_BLOCKS &&
+			(top->small_bits[blkno / 32] & (1U << (blkno % 32))) != 0;
+
+	chunk = ps_chunk_lookup(&top->key, hash, blkno / PS_CHUNK_BLOCKS, false);
 	return chunk != NULL && (chunk->bits[off / 32] & (1U << (off % 32))) != 0;
 }
 
 static void
-ps_top_set_bit(const PsForkKey *key, uint32 hash, BlockNumber blkno)
+ps_top_set_bit(PsTopFork *top, uint32 hash, BlockNumber blkno)
 {
-	PsChunk    *chunk = ps_chunk_lookup(key, hash, blkno / PS_CHUNK_BLOCKS, true);
+	PsChunk    *chunk;
 	uint32		off = blkno % PS_CHUNK_BLOCKS;
 
+	if (top->small_bitmap)
+	{
+		Assert(blkno < PS_SMALL_BLOCKS);
+		top->small_bits[blkno / 32] |= 1U << (blkno % 32);
+		return;
+	}
+
+	chunk = ps_chunk_lookup(&top->key, hash, blkno / PS_CHUNK_BLOCKS, true);
+	if (chunk == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("out of page store bitmap chunks"),
+				 errhint("You might need to increase \"%s\".",
+						 "pagestore_max_bitmap_chunks")));
 	chunk->bits[off / 32] |= 1U << (off % 32);
+}
+
+/*
+ * Have the bitmap chunks for blocks from up to to of the fork's top layer
+ * entry, so that setting their bits can't fail.  Returns false if there
+ * aren't enough.  Caller holds the freeze lock, so they stay.
+ */
+static bool
+ps_top_reserve_chunks(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber from, BlockNumber to)
+{
+	PsForkKey	key;
+	uint32		hash;
+	LWLock	   *lock;
+	PsTopFork  *top;
+	bool		ok = true;
+
+	ps_key_init(&key, reln->smgr_rlocator.locator, forknum);
+	hash = ps_fork_hash(&key);
+	lock = ps_partition_lock(hash);
+
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	top = ps_top_lookup(&key, hash);
+	for (uint32 chunkno = from / PS_CHUNK_BLOCKS;
+		 ok && (top == NULL || !top->small_bitmap) &&
+		 (uint64) chunkno * PS_CHUNK_BLOCKS < to;
+		 chunkno++)
+		ok = ps_chunk_lookup(&key, hash, chunkno, true) != NULL;
+	LWLockRelease(lock);
+	return ok;
 }
 
 /* Clear the bits at or above from, below the fork's old base. */
 static void
-ps_top_clear_bits(const PsForkKey *key, uint32 hash, BlockNumber from,
+ps_top_clear_bits(PsTopFork *top, uint32 hash, BlockNumber from,
 				  BlockNumber oldbase)
 {
+	const PsForkKey *key = &top->key;
+
+	if (top->small_bitmap)
+	{
+		for (BlockNumber blkno = from; blkno < Min(oldbase, PS_SMALL_BLOCKS);
+			 blkno++)
+			top->small_bits[blkno / 32] &= ~(1U << (blkno % 32));
+		return;
+	}
+
 	for (uint32 chunkno = from / PS_CHUNK_BLOCKS;
 		 (uint64) chunkno * PS_CHUNK_BLOCKS < oldbase;
 		 chunkno++)
@@ -989,6 +1190,7 @@ ps_top_clear_bits(const PsForkKey *key, uint32 hash, BlockNumber from,
 			hash_search_with_hash_value(PsChunks, &chunk->key,
 										ps_chunk_hash(hash, chunkno),
 										HASH_REMOVE, NULL);
+			pg_atomic_fetch_sub_u32(&PsCtl->top_chunks, 1);
 			continue;
 		}
 		for (uint32 off = from - chunkstart; off < PS_CHUNK_BLOCKS; off++)
@@ -1001,19 +1203,27 @@ ps_top_remove(PsTopFork *top, uint32 hash)
 {
 	PsForkKey	key = top->key;
 
-	ps_top_clear_bits(&key, hash, 0, top->base);
+	ps_top_clear_bits(top, hash, 0, top->base);
 	hash_search_with_hash_value(PsTopForks, &key, hash, HASH_REMOVE, NULL);
+	pg_atomic_fetch_sub_u32(&PsCtl->top_forks, 1);
 }
 
 /* Copy a top layer fork's bitmap below base out of shared memory. */
 static uint32 *
-ps_top_snapshot_bits(const PsForkKey *key, uint32 hash, BlockNumber base)
+ps_top_snapshot_bits(const PsTopFork *top, uint32 hash, BlockNumber base)
 {
+	const PsForkKey *key = &top->key;
 	size_t		nwords = ps_bitmap_words(base);
 	uint32	   *bits;
 
 	bits = MemoryContextAllocZero(PsCxt ? PsCxt : CurrentMemoryContext,
 								  Max(nwords, 1) * sizeof(uint32));
+	if (top->small_bitmap)
+	{
+		memcpy(bits, top->small_bits,
+			   Min(nwords, PS_SMALL_WORDS) * sizeof(uint32));
+		return bits;
+	}
 	for (uint32 chunkno = 0;
 		 (uint64) chunkno * PS_CHUNK_BLOCKS < base;
 		 chunkno++)
@@ -1127,7 +1337,7 @@ ps_load_top_layer(void)
 		}
 
 		top->kind = PS_FORK_DATA;
-		top->base = base;
+		ps_top_set_initial_base(top, base);
 		if (base > 0 || !ent->has_data)
 		{
 			struct stat st;
@@ -1153,7 +1363,7 @@ ps_load_top_layer(void)
 			for (BlockNumber blkno = 0; bits && blkno < base; blkno++)
 			{
 				if (bits[blkno / 32] & (1U << (blkno % 32)))
-					ps_top_set_bit(&ent->key, hash, blkno);
+					ps_top_set_bit(top, hash, blkno);
 			}
 		}
 	}
@@ -1338,7 +1548,7 @@ ps_resolve_block(const PsForkKey *key, uint32 hash, PsTopFork *top,
 	{
 		if (top->kind == PS_FORK_DROPPED)
 			return 0;
-		if (blkno >= top->base || ps_top_bit(key, hash, blkno))
+		if (blkno >= top->base || ps_top_bit(top, hash, blkno))
 			return PS_TOPGEN();
 	}
 
@@ -1448,12 +1658,14 @@ ps_open_file(SMgrRelation reln, ForkNumber forknum, uint32 gen, bool create)
 
 /*
  * Return the fork's top layer entry, giving the fork files in the top layer
- * if it has none yet.  Errors out if the fork doesn't exist.  Caller holds
- * the freeze lock in shared mode, and the fork's partition lock exclusively.
+ * if it has none yet.  Errors out if the fork doesn't exist.  Returns NULL if
+ * the top layer has no room for the fork, unless critical; the caller then
+ * lets go of its locks and calls ps_report_full().  Caller holds the freeze
+ * lock in shared mode, and the fork's partition lock exclusively.
  */
 static PsTopFork *
 ps_ensure_top(SMgrRelation reln, ForkNumber forknum, const PsForkKey *key,
-			  uint32 hash)
+			  uint32 hash, bool critical)
 {
 	PsTopFork  *top;
 	PsFrozenFork *lower;
@@ -1470,6 +1682,8 @@ ps_ensure_top(SMgrRelation reln, ForkNumber forknum, const PsForkKey *key,
 
 	if (ps_resolve_fork(key, NULL, &lower) == 0)
 		ps_report_missing(reln, forknum);
+	if (!ps_top_has_room(key, hash, critical))
+		return NULL;
 
 	/*
 	 * The blocks below the lower layer's size stay there until written.  The
@@ -1490,7 +1704,7 @@ ps_ensure_top(SMgrRelation reln, ForkNumber forknum, const PsForkKey *key,
 	top->kind = PS_FORK_DATA;
 	top->has_map = true;
 	top->unsynced = true;
-	top->base = lower->nblocks;
+	ps_top_set_initial_base(top, lower->nblocks);
 	return top;
 }
 
@@ -1558,6 +1772,7 @@ psexists(SMgrRelation reln, ForkNumber forknum)
 void
 pscreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
+	int			attempts;
 	PsForkKey	key;
 	uint32		hash;
 	LWLock	   *lock;
@@ -1574,6 +1789,8 @@ pscreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	hash = ps_fork_hash(&key);
 	lock = ps_partition_lock(hash);
 
+	attempts = 0;
+retry:
 	LWLockAcquire(&PsCtl->freeze_lock, LW_SHARED);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	ps_sync_stack();
@@ -1591,6 +1808,15 @@ pscreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m",
 						relpath(reln->smgr_rlocator, forknum).str)));
+	}
+
+	if (!ps_top_has_room(&key, hash, isRedo))
+	{
+		LWLockRelease(lock);
+		LWLockRelease(&PsCtl->freeze_lock);
+		if (ps_freeze_for_room(&attempts))
+			goto retry;
+		ps_report_full("fork entries", "pagestore_max_forks");
 	}
 
 	/*
@@ -1612,7 +1838,7 @@ pscreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		top = ps_top_insert(&key, hash);
 
 	top->kind = PS_FORK_DATA;
-	top->base = 0;
+	ps_top_set_initial_base(top, 0);
 	top->unsynced = true;
 
 	LWLockRelease(lock);
@@ -1665,11 +1891,11 @@ ps_unlink_fork(RelFileLocator rlocator, ForkNumber forknum, bool isRedo)
 		if (ps_write_map(topgen, &key, PS_MAP_DROPPED, 0, NULL, true, WARNING))
 		{
 			if (top)
-				ps_top_clear_bits(&key, hash, 0, top->base);
+				ps_top_clear_bits(top, hash, 0, top->base);
 			else
 				top = ps_top_insert(&key, hash);
 			top->kind = PS_FORK_DROPPED;
-			top->base = 0;
+			ps_top_set_initial_base(top, 0);
 			top->has_map = true;
 			top->map_dirty = false;
 
@@ -1708,8 +1934,8 @@ ps_unlink_fork(RelFileLocator rlocator, ForkNumber forknum, bool isRedo)
 		}
 		else
 		{
-			ps_top_clear_bits(&key, hash, 0, top->base);
-			top->base = 0;
+			ps_top_clear_bits(top, hash, 0, top->base);
+			ps_top_set_initial_base(top, 0);
 			top->has_map = false;
 			top->map_dirty = false;
 			tombstone = true;
@@ -1758,10 +1984,19 @@ ps_begin_write(SMgrRelation reln, ForkNumber forknum, BlockNumber *base)
 	hash = ps_fork_hash(&key);
 	lock = ps_partition_lock(hash);
 
-	LWLockAcquire(&PsCtl->freeze_lock, LW_SHARED);
-	LWLockAcquire(lock, LW_EXCLUSIVE);
-	ps_sync_stack();
-	top = ps_ensure_top(reln, forknum, &key, hash);
+	for (int attempts = 0;;)
+	{
+		LWLockAcquire(&PsCtl->freeze_lock, LW_SHARED);
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		ps_sync_stack();
+		top = ps_ensure_top(reln, forknum, &key, hash, false);
+		if (top != NULL)
+			break;
+		LWLockRelease(lock);
+		LWLockRelease(&PsCtl->freeze_lock);
+		if (!ps_freeze_for_room(&attempts))
+			ps_report_full("fork entries", "pagestore_max_forks");
+	}
 	top->unsynced = true;
 	gen = PS_TOPGEN();
 	if (base)
@@ -2090,7 +2325,23 @@ pswritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber start = blocknum;
 	BlockNumber total = nblocks;
 
-	gen = ps_begin_write(reln, forknum, &base);
+	/*
+	 * Blocks below the base need bits in the bitmap chunks once written. Have
+	 * the chunks before writing, so that running out fails the write, or
+	 * freezes to make room.
+	 */
+	for (int attempts = 0;;)
+	{
+		gen = ps_begin_write(reln, forknum, &base);
+		if (start >= base ||
+			ps_top_reserve_chunks(reln, forknum, start,
+								  Min((uint64) start + total, (uint64) base)))
+			break;
+		LWLockRelease(&PsCtl->freeze_lock);
+		if (!ps_freeze_for_room(&attempts))
+			ps_report_full("bitmap chunks", "pagestore_max_bitmap_chunks");
+	}
+
 	vfd = ps_open_file(reln, forknum, gen, false);
 
 	while (nblocks > 0)
@@ -2148,7 +2399,7 @@ pswritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		if (top && top->kind == PS_FORK_DATA)
 		{
 			for (BlockNumber b = start; b < start + total && b < top->base; b++)
-				ps_top_set_bit(&key, hash, b);
+				ps_top_set_bit(top, hash, b);
 			top->map_dirty = true;
 			top->map_version++;
 		}
@@ -2249,12 +2500,13 @@ pstruncate(SMgrRelation reln, ForkNumber forknum,
 	LWLockAcquire(&PsCtl->freeze_lock, LW_SHARED);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	ps_sync_stack();
-	top = ps_ensure_top(reln, forknum, &key, hash);
+	/* in a critical section: may use the reserved entries */
+	top = ps_ensure_top(reln, forknum, &key, hash, true);
 	top->unsynced = true;
 	gen = PS_TOPGEN();
 	if (nblocks < top->base)
 	{
-		ps_top_clear_bits(&key, hash, nblocks, top->base);
+		ps_top_clear_bits(top, hash, nblocks, top->base);
 		top->base = nblocks;
 		top->map_dirty = true;
 		top->map_version++;
@@ -2438,7 +2690,7 @@ pssyncfiletag(const FileTag *ftag, char *path)
 			if (top->map_dirty)
 			{
 				version = top->map_version;
-				bits = ps_top_snapshot_bits(&key, hash, top->base);
+				bits = ps_top_snapshot_bits(top, hash, top->base);
 			}
 		}
 	}
@@ -2546,7 +2798,7 @@ PageStoreCheckPoint(void)
 		if (top->kind != PS_FORK_DATA || !top->map_dirty)
 			continue;
 		hash = ps_fork_hash(&top->key);
-		bits = ps_top_snapshot_bits(&top->key, hash, top->base);
+		bits = ps_top_snapshot_bits(top, hash, top->base);
 		ps_write_map(PS_TOPGEN(), &top->key, 0, top->base, bits, false, ERROR);
 		pfree(bits);
 		top->has_map = true;
@@ -3002,7 +3254,7 @@ PageStoreFreeze(uint32 *layers, XLogRecPtr *insert_end)
 		if (top->kind == PS_FORK_DATA && top->map_dirty)
 		{
 			uint32		hash = ps_fork_hash(&top->key);
-			uint32	   *bits = ps_top_snapshot_bits(&top->key, hash, top->base);
+			uint32	   *bits = ps_top_snapshot_bits(top, hash, top->base);
 
 			ps_write_map(oldtop, &top->key, 0, top->base, bits, false, ERROR);
 			pfree(bits);
@@ -3045,6 +3297,8 @@ PageStoreFreeze(uint32 *layers, XLogRecPtr *insert_end)
 		hash_search_with_hash_value(PsTopForks, &top->key,
 									ps_fork_hash(&top->key),
 									HASH_REMOVE, NULL);
+	pg_atomic_write_u32(&PsCtl->top_forks, 0);
+	pg_atomic_write_u32(&PsCtl->top_chunks, 0);
 
 	PsCtl->layers[PsCtl->nlayers++] = newtop;
 	PsCtl->stack_version++;
@@ -3116,7 +3370,8 @@ PageStoreGetBranchKeepLSN(void)
  *
  * The template's writes since the last freeze are in the top layer, which
  * still changes.  A few are copied into the new database's own files in the
- * top layer; more, and the top layer is frozen first instead.  Freezing
+ * top layer; more, or more than the top layer's tables have room for, and
+ * the top layer is frozen first instead.  Freezing
  * fsyncs what the whole cluster wrote since its last checkpoint, which can
  * take long, so it's worth copying a little to avoid it.  Reading a database
  * counts as writing it, as reads set hint bits.
@@ -3167,6 +3422,12 @@ static void
 ps_snapshot_cleanup(int code, Datum arg)
 {
 	PsSnapshotState *state = (PsSnapshotState *) DatumGetPointer(arg);
+
+	/*
+	 * The error may have come while holding page store locks, which this
+	 * takes again.  Let go of them first, as aborting would.
+	 */
+	LWLockReleaseAll();
 
 	/* data files before their maps, the reverse of linking */
 	for (int i = state->nlinks - 1; i >= 0; i--)
@@ -3310,7 +3571,7 @@ ps_snapshot_copy_fork(const PsForkKey *src_key, Oid dst_dbid)
 		kind = top->kind;
 		base = top->base;
 		if (kind == PS_FORK_DATA && base > 0)
-			bits = ps_top_snapshot_bits(src_key, hash, base);
+			bits = ps_top_snapshot_bits(top, hash, base);
 	}
 	LWLockRelease(lock);
 	if (top == NULL)
@@ -3438,7 +3699,18 @@ PageStoreSnapshotDatabase(Oid src_dbid, Oid dst_dbid)
 		 */
 		for (int i = 0; i < nsrc_top; i++)
 			src_top_bytes += ps_allocated_bytes(topgen, &src_top[i]);
-		if (src_top_bytes > PS_SNAPSHOT_COPY_BYTES)
+
+		/*
+		 * Copying takes a fork entry, and maybe a bitmap chunk, for each fork
+		 * copied.  Freeze rather than fill the tables: the merger can't
+		 * freeze for us while we hold the branch lock.
+		 */
+		if (nsrc_top > 0 &&
+			(src_top_bytes > PS_SNAPSHOT_COPY_BYTES ||
+			 (uint64) (pg_atomic_read_u32(&PsCtl->top_forks) + nsrc_top) * 100 >=
+			 (uint64) pagestore_max_forks * PS_AUTO_FREEZE_PERCENT ||
+			 (uint64) (pg_atomic_read_u32(&PsCtl->top_chunks) + nsrc_top) * 100 >=
+			 (uint64) pagestore_max_bitmap_chunks * PS_AUTO_FREEZE_PERCENT))
 		{
 			XLogRecPtr	insert_end;
 
@@ -3595,7 +3867,7 @@ ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
 		 * In pieces of at most 32MB, between which a clone waiting stops a
 		 * reclaim in the background; the next one punches the rest.
 		 */
-		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		if (yield && ps_background_should_yield())
 			break;
 		for (end = start + 1;
 			 end < nblocks && end - start < 4096 && PS_PUNCHABLE(end);
@@ -3923,7 +4195,7 @@ ps_reclaim(PageStoreReclaimResult *result, bool wait)
 			AbsorbSyncRequests();
 
 		/* in the background, leave the rest for next time to a clone */
-		if (!wait && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		if (!wait && ps_background_should_yield())
 		{
 			hash_seq_term(&status);
 			break;
@@ -4220,7 +4492,7 @@ ps_clone_file(const char *from, const char *to, bool yield, bool *yielded)
 
 		CHECK_FOR_INTERRUPTS();
 		if (yield && (offset / BLCKSZ) % 1024 == 0 &&
-			pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+			ps_background_should_yield())
 		{
 			*yielded = true;
 			break;
@@ -4335,7 +4607,7 @@ ps_pair_cost(uint32 lower, uint32 upper, bool yield, bool *yielded)
 	forks = ps_pair_forks(lower, upper, &nforks);
 	for (int i = 0; i < nforks; i++)
 	{
-		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		if (yield && ps_background_should_yield())
 		{
 			*yielded = true;
 			break;
@@ -4405,7 +4677,7 @@ ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
 			continue;
 		CHECK_FOR_INTERRUPTS();
 		if (yield && ++checked % 1024 == 0 &&
-			pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+			ps_background_should_yield())
 		{
 			*yielded = true;
 			break;
@@ -4577,7 +4849,7 @@ ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen, bool yield,
 		char		to[MAXPGPATH];
 
 		CHECK_FOR_INTERRUPTS();
-		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		if (yield && ps_background_should_yield())
 		{
 			*yielded = true;
 			break;
@@ -4928,11 +5200,47 @@ PageStoreMergerRegister(void)
 	RegisterBackgroundWorker(&bgw);
 }
 
+/*
+ * Freeze the top layer if its tables are getting full, as
+ * ps_maybe_request_freeze() asked.  The page store merger's job.
+ */
+static void
+ps_auto_freeze(void)
+{
+	uint32		layers[PAGESTORE_MAX_LAYERS];
+	XLogRecPtr	insert_end;
+	uint32		forks;
+	uint32		chunks;
+
+	if (pg_atomic_unlocked_test_flag(&PsCtl->freeze_requested))
+		return;
+	if (!pagestore_auto_freeze)
+	{
+		pg_atomic_clear_flag(&PsCtl->freeze_requested);
+		return;
+	}
+
+	forks = pg_atomic_read_u32(&PsCtl->top_forks);
+	chunks = pg_atomic_read_u32(&PsCtl->top_chunks);
+	LWLockAcquire(&PsCtl->branch_lock, LW_EXCLUSIVE);
+	(void) PageStoreFreeze(layers, &insert_end);
+	LWLockRelease(&PsCtl->branch_lock);
+	pg_atomic_clear_flag(&PsCtl->freeze_requested);
+
+	ereport(LOG,
+			(errmsg("page store froze its top layer, which held %u of %d fork entries and %u of %d bitmap chunks",
+					forks, pagestore_max_forks,
+					chunks, pagestore_max_bitmap_chunks)));
+}
+
 void
 PageStoreMergerMain(Datum main_arg)
 {
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
+
+	/* where ps_maybe_request_freeze() wakes us */
+	PsCtl->merger_procno = MyProcNumber;
 
 	for (;;)
 	{
@@ -4945,6 +5253,7 @@ PageStoreMergerMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
+		ps_auto_freeze();
 		if (pagestore_max_frozen_layers > 0 &&
 			PageStoreMerge(pagestore_max_frozen_layers, false, &result) &&
 			result.merged_layers > 0)
@@ -4952,6 +5261,8 @@ PageStoreMergerMain(Datum main_arg)
 					(errmsg("page store merged %d layers, writing %lld kB",
 							result.merged_layers * 2,
 							(long long) (result.written_bytes / 1024))));
+		/* a merge stops early when asked to freeze */
+		ps_auto_freeze();
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -70,6 +70,7 @@ tests += {
       't/060_multixact_crashed_updater.pl',
       't/060_pagestore_branch.pl',
       't/061_pagestore_snapshot_database.pl',
+      't/062_pagestore_limits.pl',
     ],
   },
 }

@@ -73,6 +73,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_database.h"
 #include "common/file_utils.h"
 #include "common/relpath.h"
 #include "access/htup_details.h"
@@ -84,6 +85,7 @@
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/syslogger.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/pagestore.h"
@@ -715,6 +717,43 @@ pg_pagestore_reclaim(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
 													  values, nulls)));
+}
+
+/*
+ * pg_pagestore_freeze(database name) returns int
+ *
+ * Freeze the page store's top layer, so that what's written so far is shared
+ * by branches and by databases created with STRATEGY SNAPSHOT from then on,
+ * rather than copied, and the top layer's entries are free again.  With a
+ * database, first write out its buffers, so that the frozen layers have all
+ * of it: a template frozen so stays frozen while nobody writes to it.
+ * Returns the number of frozen layers.
+ */
+Datum
+pg_pagestore_freeze(PG_FUNCTION_ARGS)
+{
+	uint32		layers[PAGESTORE_MAX_LAYERS];
+	XLogRecPtr	insert_end;
+	int			nfrozen;
+
+	if (!PageStoreEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the cluster does not use the page store")));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress")));
+
+	if (!PG_ARGISNULL(0))
+		FlushDatabaseBuffers(get_database_oid(NameStr(*PG_GETARG_NAME(0)),
+											  false));
+
+	LWLockAcquire(PageStoreBranchLock(), LW_EXCLUSIVE);
+	nfrozen = PageStoreFreeze(layers, &insert_end);
+	LWLockRelease(PageStoreBranchLock());
+
+	PG_RETURN_INT32(nfrozen);
 }
 
 /*

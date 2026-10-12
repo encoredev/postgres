@@ -3178,6 +3178,14 @@ initialize_data_directory(void)
 
 	make_postgres(cmdfd);
 
+	/*
+	 * Freeze what initdb wrote, so that the server starts with an empty top
+	 * layer and copies of the template databases share their files.  After a
+	 * checkpoint, so that the frozen layer has all of it.
+	 */
+	if (pagestore)
+		PG_CMD_PUTS("CHECKPOINT;\n\nSELECT pg_pagestore_freeze();\n\n");
+
 	PG_CMD_CLOSE();
 	termPQExpBuffer(&cmd);
 

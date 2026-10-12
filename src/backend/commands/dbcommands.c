@@ -1753,6 +1753,13 @@ createdb_failure_callback(int code, Datum arg)
 	createdb_failure_params *fparms = (createdb_failure_params *) DatumGetPointer(arg);
 
 	/*
+	 * The error may have come while holding LWLocks that removing the new
+	 * database's files takes, such as the page store's.  Let go of them
+	 * first, as aborting would.
+	 */
+	LWLockReleaseAll();
+
+	/*
 	 * If we were copying database at block levels then drop pages for the
 	 * destination database that are in the shared buffer cache.  And tell
 	 * checkpointer to forget any pending fsync and unlink requests for files
