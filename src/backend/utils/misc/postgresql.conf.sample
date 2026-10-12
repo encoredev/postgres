@@ -191,6 +191,8 @@
 #max_notify_queue_pages = 1048576       # limits the number of SLRU pages allocated
                                         # for NOTIFY / LISTEN queue
 
+#pagestore_auto_freeze = on             # freeze the top layer when its tables
+                                        # are 75% full
 #pagestore_max_forks = 65536            # min 1024
                                         # (change requires restart)
 #pagestore_max_bitmap_chunks = 16384    # min 64

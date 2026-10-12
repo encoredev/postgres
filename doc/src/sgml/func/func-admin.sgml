@@ -558,6 +558,34 @@ LOG:  Grand total: 1651920 bytes in 201 blocks; 622360 free (88 chunks); 1029560
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>pg_pagestore_freeze</primary>
+        </indexterm>
+        <function>pg_pagestore_freeze</function> (
+          <optional> <parameter>database</parameter> <type>name</type>
+          </optional> )
+        <returnvalue>integer</returnvalue>
+       </para>
+       <para>
+        Freezes the page store's top layer, as <function>pg_branch</function>
+        does, and returns the number of frozen layers.  What is written up to
+        then is shared rather than copied by later branches and by databases
+        created with <literal>STRATEGY SNAPSHOT</literal>, and the top layer's
+        entries, which <xref linkend="guc-pagestore-max-forks"/> and
+        <xref linkend="guc-pagestore-max-bitmap-chunks"/> limit, are free
+        again.  With a <parameter>database</parameter>, its buffers are
+        written out first, so that the frozen layers have all of it: freeze a
+        template once nobody writes to it any more, and copies of it take no
+        entries until they are written to.
+       </para>
+       <para>
+        This function is restricted to superusers by default, but other users
+        can be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>pg_pagestore_merge</primary>
         </indexterm>
         <function>pg_pagestore_merge</function> (

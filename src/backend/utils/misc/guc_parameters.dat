@@ -2317,6 +2317,12 @@
   boot_val => '"pgoutput, test_decoding"',
 },
 
+{ name => 'pagestore_auto_freeze', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_DISK',
+  short_desc => 'Freezes the page store\'s top layer when its fork entries or bitmap chunks run low.',
+  variable => 'pagestore_auto_freeze',
+  boot_val => 'true',
+},
+
 { name => 'pagestore_max_bitmap_chunks', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_DISK',
   short_desc => 'Sets the number of bitmap chunks the page store can keep for its top layer.',
   long_desc => 'Each chunk records which of 8192 blocks of a relation fork the top layer has written over.',

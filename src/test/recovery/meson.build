@@ -69,6 +69,7 @@ tests += {
       't/059_remote_apply_status_interval.pl',
       't/060_pagestore_branch.pl',
       't/061_pagestore_snapshot_database.pl',
+      't/062_pagestore_limits.pl',
     ],
   },
 }
