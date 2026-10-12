@@ -142,6 +142,17 @@ CREATE DATABASE <replaceable class="parameter">name</replaceable>
         <literal>FILE_COPY</literal> strategy is affected by the <xref
         linkend="guc-file-copy-method"/> setting.
        </para>
+       <para>
+        In a cluster that uses the page store (see <xref
+        linkend="app-initdb-option-pagestore"/>), the
+        <literal>SNAPSHOT</literal> strategy makes the new database share the
+        template's files instead of copying them, so that creating it takes
+        about as long whatever the template's size.  Each database's writes
+        from then on go to files of its own.  It writes a single small record
+        to the write-ahead log, and needs no checkpoint.  The template and the
+        new database must have all of their relations in the
+        <literal>pg_default</literal> tablespace.
+       </para>
       </listitem>
      </varlistentry>
      <varlistentry id="create-database-locale">

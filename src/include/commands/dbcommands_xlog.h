@@ -21,10 +21,12 @@
 #define XLOG_DBASE_CREATE_FILE_COPY		0x00
 #define XLOG_DBASE_CREATE_WAL_LOG		0x10
 #define XLOG_DBASE_DROP					0x20
+#define XLOG_DBASE_CREATE_SNAPSHOT		0x30
 
 /*
  * Single WAL record for an entire CREATE DATABASE operation. This is used
- * by the FILE_COPY strategy.
+ * by the FILE_COPY strategy, and by the SNAPSHOT strategy, which logs it
+ * once the new database shares the template's page store files.
  */
 typedef struct xl_dbase_create_file_copy_rec
 {
