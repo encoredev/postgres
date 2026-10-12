@@ -83,11 +83,15 @@
  * CREATEDB_FILE_COPY will simply perform a file system level copy of the
  * database and log a single record for each tablespace copied. To make this
  * safe, it also triggers checkpoints before and after the operation.
+ *
+ * CREATEDB_SNAPSHOT, in a cluster that uses the page store, makes the new
+ * database share the template's files, and logs a single record.
  */
 typedef enum CreateDBStrategy
 {
 	CREATEDB_WAL_LOG,
 	CREATEDB_FILE_COPY,
+	CREATEDB_SNAPSHOT,
 } CreateDBStrategy;
 
 typedef struct
@@ -131,6 +135,8 @@ static bool check_db_file_conflict(Oid db_id);
 static int	errdetail_busy_db(int notherbackends, int npreparedxacts);
 static void CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 									  Oid dst_tsid);
+static void CreateDatabaseUsingSnapshot(Oid src_dboid, Oid dst_dboid,
+										Oid src_tsid, Oid dst_tsid);
 static List *ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath);
 static List *ScanSourceDatabasePgClassPage(Page page, Buffer buf, Oid tbid,
 										   Oid dbid, char *srcpath,
@@ -687,6 +693,89 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 }
 
 /*
+ * Create a new database using the SNAPSHOT strategy.
+ *
+ * In a cluster that uses the page store, the new database shares the
+ * template's files: see PageStoreSnapshotDatabase().  That costs a link per
+ * file, whatever the template's size, and needs neither the checkpoints of
+ * FILE_COPY nor the WAL of WAL_LOG.  The template's relations, and the new
+ * database, must be in pg_default.
+ */
+static void
+CreateDatabaseUsingSnapshot(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
+							Oid dst_tsid)
+{
+	TableScanDesc scan;
+	Relation	rel;
+	HeapTuple	tuple;
+	char	   *srcpath;
+	char	   *dstpath;
+	char	   *parentpath;
+	xl_dbase_create_file_copy_rec xlrec;
+
+	if (src_tsid != DEFAULTTABLESPACE_OID || dst_tsid != DEFAULTTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("strategy \"snapshot\" requires both databases to be in tablespace \"pg_default\"")));
+
+	/* Nor may the template have relations in other tablespaces */
+	rel = table_open(TableSpaceRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_tablespace spaceform = (Form_pg_tablespace) GETSTRUCT(tuple);
+		struct stat st;
+
+		if (spaceform->oid == GLOBALTABLESPACE_OID ||
+			spaceform->oid == DEFAULTTABLESPACE_OID)
+			continue;
+
+		srcpath = GetDatabasePath(src_dboid, spaceform->oid);
+		if (stat(srcpath, &st) == 0 && S_ISDIR(st.st_mode) &&
+			!directory_is_empty(srcpath))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("strategy \"snapshot\" requires the template's relations to be in tablespace \"pg_default\""),
+					 errdetail("The template database has relations in tablespace \"%s\".",
+							   NameStr(spaceform->spcname))));
+		pfree(srcpath);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	/* The template's buffers, unlogged relations' too, go to its files */
+	FlushDatabaseBuffers(src_dboid);
+
+	/* Copy the files that aren't relations: PG_VERSION, the relation map */
+	srcpath = GetDatabasePath(src_dboid, DEFAULTTABLESPACE_OID);
+	dstpath = GetDatabasePath(dst_dboid, DEFAULTTABLESPACE_OID);
+	copydir(srcpath, dstpath, false);
+	parentpath = pstrdup(dstpath);
+	get_parent_directory(parentpath);
+	fsync_fname(parentpath, true);
+
+	PageStoreSnapshotDatabase(src_dboid, dst_dboid);
+
+	/*
+	 * Logged once the new database's files are durable, so that replay can
+	 * skip it when it finds them there; see dbase_redo().
+	 */
+	xlrec.db_id = dst_dboid;
+	xlrec.tablespace_id = DEFAULTTABLESPACE_OID;
+	xlrec.src_db_id = src_dboid;
+	xlrec.src_tablespace_id = DEFAULTTABLESPACE_OID;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xl_dbase_create_file_copy_rec));
+	(void) XLogInsert(RM_DBASE_ID,
+					  XLOG_DBASE_CREATE_SNAPSHOT | XLR_SPECIAL_REL_UPDATE);
+
+	pfree(srcpath);
+	pfree(dstpath);
+	pfree(parentpath);
+}
+
+/*
  * CREATE DATABASE
  */
 Oid
@@ -1051,11 +1140,19 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			dbstrategy = CREATEDB_WAL_LOG;
 		else if (pg_strcasecmp(strategy, "file_copy") == 0)
 			dbstrategy = CREATEDB_FILE_COPY;
+		else if (pg_strcasecmp(strategy, "snapshot") == 0)
+		{
+			if (!PageStoreEnabled())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("strategy \"snapshot\" requires a cluster that uses the page store")));
+			dbstrategy = CREATEDB_SNAPSHOT;
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid create database strategy \"%s\"", strategy),
-					 errhint("Valid strategies are \"wal_log\" and \"file_copy\".")));
+					 errhint("Valid strategies are \"wal_log\", \"file_copy\" and \"snapshot\".")));
 	}
 
 	/* If encoding or locales are defaulted, use source's setting */
@@ -1564,6 +1661,9 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		if (dbstrategy == CREATEDB_WAL_LOG)
 			CreateDatabaseUsingWalLog(src_dboid, dboid, src_deftablespace,
 									  dst_deftablespace);
+		else if (dbstrategy == CREATEDB_SNAPSHOT)
+			CreateDatabaseUsingSnapshot(src_dboid, dboid, src_deftablespace,
+										dst_deftablespace);
 		else
 			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
 										dst_deftablespace);
@@ -3159,6 +3259,10 @@ check_db_file_conflict(Oid db_id)
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
 
+	/* The page store keeps pg_default's relations elsewhere */
+	if (!result)
+		result = PageStoreDatabaseInUse(db_id);
+
 	return result;
 }
 
@@ -3321,6 +3425,25 @@ dbase_redo(XLogReaderState *record)
 
 	/* Backup blocks are not used in dbase records */
 	Assert(!XLogRecHasAnyBlockRefs(record));
+
+	if (info == XLOG_DBASE_CREATE_SNAPSHOT)
+	{
+		xl_dbase_create_file_copy_rec *xlrec =
+			(xl_dbase_create_file_copy_rec *) XLogRecGetData(record);
+
+		/*
+		 * The new database had its files before this was logged.  Where they
+		 * still are, as in crash recovery or in a branch, there's nothing to
+		 * do.  Elsewhere, as in a standby, copy the template as FILE_COPY's
+		 * replay does, at the cost of its size.  Files of the new database
+		 * can be missing for another reason: it was dropped later, and its
+		 * files reclaimed.  Then the copy is wasted work, but no harm, as
+		 * replay will drop it again.
+		 */
+		if (PageStoreDatabaseInUse(xlrec->db_id))
+			return;
+		info = XLOG_DBASE_CREATE_FILE_COPY;
+	}
 
 	if (info == XLOG_DBASE_CREATE_FILE_COPY)
 	{

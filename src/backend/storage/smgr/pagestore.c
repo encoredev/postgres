@@ -180,6 +180,13 @@ typedef struct PsShared
 	uint32		layers[PAGESTORE_MAX_LAYERS];
 
 	/*
+	 * Bumped when frozen layers gain files, which CREATE DATABASE ...
+	 * STRATEGY SNAPSHOT gives them, so that backends read them again. Changed
+	 * while holding all partition locks, like the stack.
+	 */
+	uint32		index_version;
+
+	/*
 	 * The generation of the next layer to make.  A generation is never reused
 	 * while the server runs, because backends cache what they read of frozen
 	 * layers by generation.  The stack's order is that of the STACK file, not
@@ -192,6 +199,15 @@ typedef struct PsShared
 
 	/* set while PageStoreReclaim() or PageStoreMerge() runs */
 	pg_atomic_flag reclaim_running;
+
+	/* set while a process removes merged layers' trash */
+	pg_atomic_flag trash_emptying;
+
+	/*
+	 * CREATE DATABASE ... STRATEGY SNAPSHOT calls waiting for that flag.
+	 * Reclaiming and merging in the background stop early for them.
+	 */
+	pg_atomic_uint32 clones_waiting;
 
 	LWLock		freeze_lock;
 	LWLock		branch_lock;
@@ -235,6 +251,7 @@ static HTAB *ps_indexed_gens = NULL;	/* frozen layers read into ps_frozen */
 
 /* Backend-local copy of the stack */
 static uint32 ps_local_stack_version = 0;
+static uint32 ps_local_index_version = 0;
 static int	ps_local_nlayers = 0;
 static uint32 ps_local_layers[PAGESTORE_MAX_LAYERS];
 
@@ -436,6 +453,8 @@ PageStoreShmemInit(void *arg)
 	memset(PsCtl, 0, sizeof(PsShared));
 	pg_atomic_init_u64(&PsCtl->branch_keep_lsn, InvalidXLogRecPtr);
 	pg_atomic_init_flag(&PsCtl->reclaim_running);
+	pg_atomic_init_flag(&PsCtl->trash_emptying);
+	pg_atomic_init_u32(&PsCtl->clones_waiting, 0);
 	LWLockInitialize(&PsCtl->freeze_lock, LWTRANCHE_PAGESTORE);
 	LWLockInitialize(&PsCtl->branch_lock, LWTRANCHE_PAGESTORE);
 	for (int i = 0; i < PS_NUM_PARTITIONS; i++)
@@ -473,7 +492,8 @@ static void
 ps_sync_stack(void)
 {
 	if (ps_local_nlayers > 0 &&
-		ps_local_stack_version == PsCtl->stack_version)
+		ps_local_stack_version == PsCtl->stack_version &&
+		ps_local_index_version == PsCtl->index_version)
 		return;
 
 	ps_local_nlayers = PsCtl->nlayers;
@@ -501,6 +521,13 @@ ps_sync_stack(void)
 		}
 		for (int i = 0; i < ngone; i++)
 			ps_forget_layer(gone[i]);
+	}
+
+	/* Read again the frozen layers that gained files */
+	if (ps_local_index_version != PsCtl->index_version)
+	{
+		ps_local_index_version = PsCtl->index_version;
+		ps_forget_all_layers();
 	}
 }
 
@@ -2877,6 +2904,25 @@ PageStoreRelFileNumberInUse(RelFileLocator rlocator)
 	return in_use;
 }
 
+/*
+ * Does any layer have files of the database?  Like a directory left behind
+ * in a tablespace, the files of a dropped database, or of one whose creation
+ * failed, keep its OID from being used again until they're gone.
+ */
+bool
+PageStoreDatabaseInUse(Oid dbid)
+{
+	PsForkKey  *forks;
+	int			nforks;
+
+	if (!PageStoreEnabled())
+		return false;
+
+	forks = ps_list_forks(false, dbid, &nforks);
+	pfree(forks);
+	return nforks > 0;
+}
+
 
 /*
  * Branching
@@ -3058,6 +3104,376 @@ PageStoreGetBranchKeepLSN(void)
 
 
 /*
+ * Databases sharing a template's files
+ *
+ * CREATE DATABASE ... STRATEGY SNAPSHOT gives each of the template's files in
+ * a frozen layer a second name, the new database's, in the same layer.
+ * Frozen files never change, so neither database sees what the other writes
+ * from then on: that goes to its own files in the top layer.  Reclaiming
+ * leaves the blocks of a file with more than one name alone, so a block one
+ * of them no longer reads stays for the other, and dropping either removes
+ * only its own names.
+ *
+ * The template's writes since the last freeze are in the top layer, which
+ * still changes.  A few are copied into the new database's own files in the
+ * top layer; more, and the top layer is frozen first instead.  Freezing
+ * fsyncs what the whole cluster wrote since its last checkpoint, which can
+ * take long, so it's worth copying a little to avoid it.  Reading a database
+ * counts as writing it, as reads set hint bits.
+ */
+
+/* Most of the template's top layer data to copy rather than freeze */
+#define PS_SNAPSHOT_COPY_BYTES	(16 * 1024 * 1024)
+
+static bool ps_bitmap_test(const uint32 *bits, size_t nwords, uint64 blkno);
+static int64 ps_allocated_bytes(uint32 gen, const PsForkKey *key);
+
+/* A name given to one of the template's files */
+typedef struct PsSnapshotLink
+{
+	uint32		gen;
+	PsForkKey	key;			/* the new database's */
+	bool		is_map;
+} PsSnapshotLink;
+
+typedef struct PsSnapshotState
+{
+	PsSnapshotLink *links;		/* made so far, to take back on error */
+	int			nlinks;
+	int			maxlinks;
+	bool		holding_flag;	/* holds reclaim_running */
+	bool		waiting;		/* counted in clones_waiting */
+} PsSnapshotState;
+
+static void
+ps_name_path(char *path, uint32 gen, const PsForkKey *key, bool is_map)
+{
+	if (is_map)
+		ps_map_path(path, gen, key);
+	else
+		ps_data_path(path, gen, key);
+}
+
+/* Make backends read frozen layers again; see index_version. */
+static void
+ps_bump_index_version(void)
+{
+	ps_acquire_all_partitions(LW_EXCLUSIVE);
+	PsCtl->index_version++;
+	ps_release_all_partitions();
+}
+
+static void
+ps_snapshot_cleanup(int code, Datum arg)
+{
+	PsSnapshotState *state = (PsSnapshotState *) DatumGetPointer(arg);
+
+	/* data files before their maps, the reverse of linking */
+	for (int i = state->nlinks - 1; i >= 0; i--)
+	{
+		char		path[MAXPGPATH];
+
+		ps_name_path(path, state->links[i].gen, &state->links[i].key,
+					 state->links[i].is_map);
+		if (unlink(path) < 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+	}
+	if (state->nlinks > 0)
+		ps_bump_index_version();
+	if (state->waiting)
+		pg_atomic_fetch_sub_u32(&PsCtl->clones_waiting, 1);
+	if (state->holding_flag)
+		pg_atomic_clear_flag(&PsCtl->reclaim_running);
+}
+
+/* Give the template's files in one frozen layer the new database's names. */
+static void
+ps_snapshot_layer(uint32 gen, Oid src_dbid, Oid dst_dbid,
+				  PsSnapshotState *state)
+{
+	char		dir[MAXPGPATH];
+	DIR		   *dirdesc;
+	struct dirent *de;
+	PsSnapshotLink *names = NULL;
+	int			nnames = 0;
+	int			maxnames = 0;
+	int			first = state->nlinks;
+
+	ps_layer_path(dir, gen);
+	dirdesc = AllocateDir(dir);
+	while ((de = ReadDir(dirdesc, dir)) != NULL)
+	{
+		PsForkKey	key;
+		bool		is_map;
+		bool		is_tmp;
+
+		if (!ps_parse_name(de->d_name, &key, &is_map, &is_tmp) || is_tmp ||
+			key.rlocator.spcOid != DEFAULTTABLESPACE_OID ||
+			key.rlocator.dbOid != src_dbid)
+			continue;
+		if (nnames == maxnames)
+		{
+			maxnames = Max(64, maxnames * 2);
+			names = names ? repalloc_array(names, PsSnapshotLink, maxnames) :
+				palloc_array(PsSnapshotLink, maxnames);
+		}
+		names[nnames].gen = gen;
+		names[nnames].key = key;
+		names[nnames].is_map = is_map;
+		nnames++;
+	}
+	FreeDir(dirdesc);
+
+	/* maps first: a data file without its map would hide the layers below */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		for (int i = 0; i < nnames; i++)
+		{
+			PsSnapshotLink *name = &names[i];
+			char		from[MAXPGPATH];
+			char		to[MAXPGPATH];
+			PsForkKey	dst = name->key;
+
+			if (name->is_map != (pass == 0))
+				continue;
+			CHECK_FOR_INTERRUPTS();
+
+			dst.rlocator.dbOid = dst_dbid;
+			ps_name_path(from, gen, &name->key, name->is_map);
+			ps_name_path(to, gen, &dst, name->is_map);
+			if (link(from, to) < 0)
+			{
+				/* the leftover of a dropped fork, unlinked by a checkpoint */
+				if (errno == ENOENT)
+					continue;
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not link file \"%s\" to \"%s\": %m",
+								from, to)));
+			}
+
+			if (state->nlinks == state->maxlinks)
+			{
+				state->maxlinks = Max(256, state->maxlinks * 2);
+				state->links = state->links ?
+					repalloc_array(state->links, PsSnapshotLink, state->maxlinks) :
+					palloc_array(PsSnapshotLink, state->maxlinks);
+			}
+			state->links[state->nlinks].gen = gen;
+			state->links[state->nlinks].key = dst;
+			state->links[state->nlinks].is_map = name->is_map;
+			state->nlinks++;
+		}
+	}
+	if (names)
+		pfree(names);
+
+	if (state->nlinks > first)
+		fsync_fname(dir, true);
+}
+
+/*
+ * Copy one of the template's forks in the top layer into the new database's
+ * fork, which has the template's frozen files already: the blocks the top
+ * layer holds, and the size.  Durably, as none of this is WAL-logged.
+ */
+static void
+ps_snapshot_copy_fork(const PsForkKey *src_key, Oid dst_dbid)
+{
+	RelFileLocator dst_rlocator = src_key->rlocator;
+	ForkNumber	forknum = src_key->forknum;
+	SMgrRelation src;
+	SMgrRelation dst;
+	PsForkKey	dst_key = *src_key;
+	uint32		hash = ps_fork_hash(src_key);
+	LWLock	   *lock = ps_partition_lock(hash);
+	PsTopFork  *top;
+	uint8		kind = PS_FORK_DROPPED;
+	BlockNumber base = 0;
+	uint32	   *bits = NULL;
+	uint32		topgen;
+	BlockNumber src_nblocks;
+	BlockNumber dst_nblocks;
+	PGIOAlignedBlock buf;
+
+	dst_rlocator.dbOid = dst_dbid;
+	dst_key.rlocator.dbOid = dst_dbid;
+
+	LWLockAcquire(lock, LW_SHARED);
+	ps_sync_stack();
+	topgen = PS_TOPGEN();
+	top = ps_top_lookup(src_key, hash);
+	if (top)
+	{
+		kind = top->kind;
+		base = top->base;
+		if (kind == PS_FORK_DATA && base > 0)
+			bits = ps_top_snapshot_bits(src_key, hash, base);
+	}
+	LWLockRelease(lock);
+	if (top == NULL)
+		return;
+
+	src = smgropen(src_key->rlocator, INVALID_PROC_NUMBER);
+	dst = smgropen(dst_rlocator, INVALID_PROC_NUMBER);
+
+	/* Dropped since the last freeze, over the frozen files */
+	if (kind == PS_FORK_DROPPED)
+	{
+		if (smgrexists(dst, forknum))
+			ps_unlink_fork(dst_rlocator, forknum, true);
+		return;
+	}
+
+	src_nblocks = smgrnblocks(src, forknum);
+	if (smgrexists(dst, forknum))
+		dst_nblocks = smgrnblocks(dst, forknum);
+	else
+	{
+		smgrcreate(dst, forknum, false);
+		dst_nblocks = 0;
+	}
+	if (dst_nblocks > src_nblocks)
+	{
+		pstruncate(dst, forknum, dst_nblocks, src_nblocks);
+		dst_nblocks = src_nblocks;
+	}
+
+	/*
+	 * Blocks the top layer doesn't hold are below its base, where the
+	 * template's frozen files, now the new database's too, have them.
+	 */
+	for (BlockNumber blkno = 0; blkno < src_nblocks; blkno++)
+	{
+		if (blkno < base && !ps_bitmap_test(bits, ps_bitmap_words(base), blkno))
+			continue;
+		if (blkno > dst_nblocks)
+			elog(ERROR, "page store fork of database %u has a gap at block %u",
+				 src_key->rlocator.dbOid, dst_nblocks);
+
+		smgrread(src, forknum, blkno, buf.data);
+		if (blkno < dst_nblocks)
+			smgrwrite(dst, forknum, blkno, buf.data, true);
+		else
+		{
+			smgrextend(dst, forknum, blkno, buf.data, true);
+			dst_nblocks++;
+		}
+	}
+	if (bits)
+		pfree(bits);
+
+	/* the data, then the map saying which blocks the top layer has */
+	ps_immedsync_layer(&dst_key, topgen);
+}
+
+/*
+ * Give a new database the relations of a template in pg_default, sharing
+ * their files.  The caller makes sure that nothing writes to the template
+ * meanwhile, and has written out its buffers.  Returns once the new names are
+ * durable.  On error, takes back the names made.
+ */
+void
+PageStoreSnapshotDatabase(Oid src_dbid, Oid dst_dbid)
+{
+	PsSnapshotState state;
+	uint32		layers[PAGESTORE_MAX_LAYERS];
+	int			nlayers;
+	uint32		topgen;
+	PsForkKey  *src_top;
+	int			nsrc_top = 0;
+	int64		src_top_bytes = 0;
+	HASH_SEQ_STATUS status;
+	PsTopFork  *top;
+
+	if (!PageStoreEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the cluster does not use the page store")));
+
+	memset(&state, 0, sizeof(state));
+	PG_ENSURE_ERROR_CLEANUP(ps_snapshot_cleanup, PointerGetDatum(&state));
+	{
+		/*
+		 * Merging and reclaiming change frozen layers; wait for them.  In the
+		 * background, they stop early for us.
+		 */
+		pg_atomic_fetch_add_u32(&PsCtl->clones_waiting, 1);
+		state.waiting = true;
+		while (!pg_atomic_test_set_flag(&PsCtl->reclaim_running))
+		{
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+		}
+		state.holding_flag = true;
+		pg_atomic_fetch_sub_u32(&PsCtl->clones_waiting, 1);
+		state.waiting = false;
+
+		/*
+		 * And pg_branch() links their files elsewhere: let it see all of the
+		 * new names, or none.
+		 */
+		LWLockAcquire(&PsCtl->branch_lock, LW_EXCLUSIVE);
+
+		/* The template's forks in the top layer */
+		src_top = palloc_array(PsForkKey, pagestore_max_forks);
+		ps_acquire_all_partitions(LW_SHARED);
+		hash_seq_init(&status, PsTopForks);
+		while ((top = hash_seq_search(&status)) != NULL)
+		{
+			if (top->key.rlocator.dbOid == src_dbid &&
+				top->key.rlocator.spcOid == DEFAULTTABLESPACE_OID)
+				src_top[nsrc_top++] = top->key;
+		}
+		nlayers = PsCtl->nlayers - 1;
+		memcpy(layers, PsCtl->layers, sizeof(uint32) * nlayers);
+		topgen = PsCtl->layers[PsCtl->nlayers - 1];
+		ps_release_all_partitions();
+
+		/*
+		 * Writes to the top layer can't make the template's files there grow
+		 * meanwhile: nobody writes to the template.
+		 */
+		for (int i = 0; i < nsrc_top; i++)
+			src_top_bytes += ps_allocated_bytes(topgen, &src_top[i]);
+		if (src_top_bytes > PS_SNAPSHOT_COPY_BYTES)
+		{
+			XLogRecPtr	insert_end;
+
+			nlayers = PageStoreFreeze(layers, &insert_end);
+			nsrc_top = 0;
+		}
+
+		for (int i = 0; i < nlayers; i++)
+			ps_snapshot_layer(layers[i], src_dbid, dst_dbid, &state);
+		if (state.nlinks > 0)
+			ps_bump_index_version();
+
+		/* Then the template's writes the frozen files lack */
+		for (int i = 0; i < nsrc_top; i++)
+			ps_snapshot_copy_fork(&src_top[i], dst_dbid);
+		if (nsrc_top > 0)
+		{
+			char		dir[MAXPGPATH];
+
+			ps_layer_path(dir, topgen);
+			fsync_fname(dir, true);
+		}
+		pfree(src_top);
+
+		LWLockRelease(&PsCtl->branch_lock);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(ps_snapshot_cleanup, PointerGetDatum(&state));
+
+	pg_atomic_clear_flag(&PsCtl->reclaim_running);
+	if (state.links)
+		pfree(state.links);
+}
+
+
+/*
  * Reclaiming space
  *
  * A frozen layer never changes, but how much of it this cluster can still
@@ -3133,7 +3549,7 @@ ps_punch_hole(int fd, off_t offset, off_t len)
  */
 static void
 ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
-				const uint32 *hidden, BlockNumber nblocks,
+				const uint32 *hidden, BlockNumber nblocks, bool yield,
 				PageStoreReclaimResult *result)
 {
 	char		path[MAXPGPATH];
@@ -3174,7 +3590,16 @@ ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
 			start++;
 			continue;
 		}
-		for (end = start + 1; end < nblocks && PS_PUNCHABLE(end); end++)
+
+		/*
+		 * In pieces of at most 32MB, between which a clone waiting stops a
+		 * reclaim in the background; the next one punches the rest.
+		 */
+		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+			break;
+		for (end = start + 1;
+			 end < nblocks && end - start < 4096 && PS_PUNCHABLE(end);
+			 end++)
 			;
 
 		/* skip what is a hole already, which is most of it after a while */
@@ -3232,7 +3657,7 @@ ps_add_dead_fork(PsDeadFork **dead, int *ndead, int *maxdead, uint32 gen,
  */
 static void
 ps_reclaim_fork(const uint32 *layers, int nlayers, const PsForkKey *key,
-				PsDeadFork **dead, int *ndead, int *maxdead,
+				PsDeadFork **dead, int *ndead, int *maxdead, bool yield,
 				PageStoreReclaimResult *result)
 {
 	bool		hide_all = false;	/* the layers above hide every block */
@@ -3298,9 +3723,25 @@ ps_reclaim_fork(const uint32 *layers, int nlayers, const PsForkKey *key,
 			}
 			if (anypunch && f->has_data)
 				ps_punch_blocks(layers[i], key, unwritten, deadbits,
-								f->nblocks, result);
+								f->nblocks, yield, result);
 			pfree(unwritten);
 			pfree(deadbits);
+		}
+
+		/*
+		 * A fork dropped over no files hides nothing, and neither is there a
+		 * fork to read: the map saying it's dropped can go too.  Only once
+		 * the files below are gone, which an earlier pass removes, so that a
+		 * crash can't bring them back.
+		 */
+		if (f->kind == PS_FORK_DROPPED)
+		{
+			bool		below = false;
+
+			for (int j = i - 1; j >= 0 && !below; j--)
+				below = ps_frozen_lookup(layers[j], key) != NULL;
+			if (!below)
+				ps_add_dead_fork(dead, ndead, maxdead, layers[i], key);
 		}
 
 		/* What the layer hides from the layers below */
@@ -3481,7 +3922,15 @@ ps_reclaim(PageStoreReclaimResult *result, bool wait)
 		if (AmCheckpointerProcess())
 			AbsorbSyncRequests();
 
-		ps_reclaim_fork(layers, nlayers, key, &dead, &ndead, &maxdead, result);
+		/* in the background, leave the rest for next time to a clone */
+		if (!wait && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		{
+			hash_seq_term(&status);
+			break;
+		}
+
+		ps_reclaim_fork(layers, nlayers, key, &dead, &ndead, &maxdead, !wait,
+						result);
 	}
 
 	/*
@@ -3716,9 +4165,12 @@ PageStoreReclaimAfterCheckpoint(void)
  * change frozen layers under it.
  */
 
-/* Clone a file where the file system can, else copy it, keeping holes. */
+/*
+ * Clone a file where the file system can, else copy it, keeping holes.  If
+ * yield is true, a copy stops early when a clone waits, setting *yielded.
+ */
 static void
-ps_clone_file(const char *from, const char *to)
+ps_clone_file(const char *from, const char *to, bool yield, bool *yielded)
 {
 	char	   *buffer;
 	int			srcfd;
@@ -3767,6 +4219,12 @@ ps_clone_file(const char *from, const char *to)
 		bool		zero = true;
 
 		CHECK_FOR_INTERRUPTS();
+		if (yield && (offset / BLCKSZ) % 1024 == 0 &&
+			pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		{
+			*yielded = true;
+			break;
+		}
 		nread = pg_pread(srcfd, buffer, BLCKSZ, offset);
 		if (nread < 0)
 			ereport(ERROR,
@@ -3863,9 +4321,12 @@ ps_pair_forks(uint32 lower, uint32 upper, int *nforks)
 	return result;
 }
 
-/* What merging a pair would write: the forks both layers have */
+/*
+ * What merging a pair would write: the forks both layers have.  If yield is
+ * true, gives up as soon as a clone waits, setting *yielded.
+ */
 static int64
-ps_pair_cost(uint32 lower, uint32 upper)
+ps_pair_cost(uint32 lower, uint32 upper, bool yield, bool *yielded)
 {
 	PsForkKey  *forks;
 	int			nforks;
@@ -3874,6 +4335,11 @@ ps_pair_cost(uint32 lower, uint32 upper)
 	forks = ps_pair_forks(lower, upper, &nforks);
 	for (int i = 0; i < nforks; i++)
 	{
+		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		{
+			*yielded = true;
+			break;
+		}
 		if (ps_fork_needs_merging(ps_frozen_lookup(lower, &forks[i]),
 								  ps_frozen_lookup(upper, &forks[i])))
 			cost += ps_allocated_bytes(lower, &forks[i]) +
@@ -3890,7 +4356,7 @@ ps_pair_cost(uint32 lower, uint32 upper)
  */
 static int64
 ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
-			  PsFrozenFork *upper)
+			  PsFrozenFork *upper, bool yield, bool *yielded)
 {
 	char		path[MAXPGPATH];
 	char		srcpath[MAXPGPATH];
@@ -3900,12 +4366,15 @@ ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
 	int64		written = 0;
 	BlockNumber base;
 	uint32	   *bits;
+	uint32		checked = 0;
 
 	ps_data_path(path, newgen, key);
 	if (lower->has_data)
 	{
 		ps_data_path(srcpath, lower->key.gen, key);
-		ps_clone_file(srcpath, path);
+		ps_clone_file(srcpath, path, yield, yielded);
+		if (*yielded)
+			return written;
 	}
 	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
 	if (fd < 0)
@@ -3935,6 +4404,12 @@ ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
 		if (!ps_frozen_holds(upper, blkno))
 			continue;
 		CHECK_FOR_INTERRUPTS();
+		if (yield && ++checked % 1024 == 0 &&
+			pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		{
+			*yielded = true;
+			break;
+		}
 
 		if (srcfd >= 0)
 		{
@@ -3969,6 +4444,15 @@ ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
 		}
 	}
 
+	/* what's written is thrown away with the merged layer */
+	if (*yielded)
+	{
+		CloseTransientFile(fd);
+		if (srcfd >= 0)
+			CloseTransientFile(srcfd);
+		return written;
+	}
+
 	if (pg_fsync(fd) != 0)
 		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
@@ -4000,14 +4484,74 @@ ps_merge_fork(uint32 newgen, const PsForkKey *key, PsFrozenFork *lower,
 	return written;
 }
 
-/* Make the layer that resolves every block as the pair does. */
+/*
+ * The files a fork both layers of a pair have, by identity.  Databases that
+ * CREATE DATABASE ... STRATEGY SNAPSHOT made share files, under their own
+ * names; forks with the same files merge the same, so the merge is done once
+ * and its result given each of their names.
+ */
+typedef struct PsPairFiles
+{
+	ino_t		ino[4];			/* lower data, lower map, upper data, upper
+								 * map; 0 for none */
+} PsPairFiles;
+
+typedef struct PsMergedFork
+{
+	PsPairFiles files;			/* hash key, must be first */
+	PsForkKey	key;			/* the fork whose merge wrote the result */
+} PsMergedFork;
+
+static void
+ps_pair_files(uint32 lower, uint32 upper, const PsForkKey *key,
+			  PsPairFiles *files)
+{
+	memset(files, 0, sizeof(PsPairFiles));
+	for (int i = 0; i < 4; i++)
+	{
+		char		path[MAXPGPATH];
+		struct stat st;
+
+		ps_name_path(path, i < 2 ? lower : upper, key, i % 2 == 1);
+		if (stat(path, &st) == 0)
+			files->ino[i] = st.st_ino;
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat file \"%s\": %m", path)));
+	}
+}
+
+/* Link a file of the merged layer, if it has one. */
+static void
+ps_link_merged(uint32 newgen, const PsForkKey *from_key,
+			   const PsForkKey *to_key, bool is_map)
+{
+	char		from[MAXPGPATH];
+	char		to[MAXPGPATH];
+
+	ps_name_path(from, newgen, from_key, is_map);
+	ps_name_path(to, newgen, to_key, is_map);
+	if (link(from, to) < 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not link file \"%s\" to \"%s\": %m", from, to)));
+}
+
+/*
+ * Make the layer that resolves every block as the pair does.  If yield is
+ * true, gives up as soon as a clone waits, setting *yielded.
+ */
 static int64
-ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen)
+ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen, bool yield,
+			  bool *yielded)
 {
 	char		dir[MAXPGPATH];
 	PsForkKey  *forks;
 	int			nforks;
 	int64		written = 0;
+	HTAB	   *merged;
+	HASHCTL		ctl;
 
 	ps_layer_path(dir, newgen);
 	if (MakePGDirectory(dir) < 0)
@@ -4016,6 +4560,12 @@ ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen)
 				 errmsg("could not create directory \"%s\": %m", dir)));
 
 	fsync_fname(PAGESTORE_DIR, true);
+
+	ctl.keysize = sizeof(PsPairFiles);
+	ctl.entrysize = sizeof(PsMergedFork);
+	ctl.hcxt = CurrentMemoryContext;
+	merged = hash_create("page store merged forks", 64, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	forks = ps_pair_forks(lower, upper, &nforks);
 	for (int i = 0; i < nforks; i++)
@@ -4027,10 +4577,30 @@ ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen)
 		char		to[MAXPGPATH];
 
 		CHECK_FOR_INTERRUPTS();
+		if (yield && pg_atomic_read_u32(&PsCtl->clones_waiting) > 0)
+		{
+			*yielded = true;
+			break;
+		}
 
 		if (ps_fork_needs_merging(fl, fu))
 		{
-			written += ps_merge_fork(newgen, &forks[i], fl, fu);
+			PsPairFiles files;
+			PsMergedFork *m;
+			bool		found;
+
+			ps_pair_files(lower, upper, &forks[i], &files);
+			m = hash_search(merged, &files, HASH_ENTER, &found);
+			if (found)
+			{
+				ps_link_merged(newgen, &m->key, &forks[i], true);
+				ps_link_merged(newgen, &m->key, &forks[i], false);
+				continue;
+			}
+			m->key = forks[i];
+			written += ps_merge_fork(newgen, &forks[i], fl, fu, yield, yielded);
+			if (*yielded)
+				break;
 			continue;
 		}
 
@@ -4064,26 +4634,81 @@ ps_merge_pair(uint32 lower, uint32 upper, uint32 newgen)
 		}
 	}
 	pfree(forks);
+	hash_destroy(merged);
 
-	fsync_fname(dir, true);
+	if (!*yielded)
+		fsync_fname(dir, true);
 	return written;
 }
 
 /*
- * Remove layer directories that the stack doesn't list, while the server
- * runs: what a merge that failed after putting its merged layer in the
- * stack left, or one that failed before.  They're found under the branch
- * lock, so no freeze is making a directory for a layer not yet in the
- * stack; and removed after every backend has closed its files, as a merge
- * does.  Generations never repeat, so nothing new can take their names.
+ * Layers taken off the stack are renamed "<gen>.trash", which is quick, and
+ * removed later, once the merge has let go of reclaim_running: removing
+ * gigabytes can take long, and a clone may be waiting.  Nothing reads them by
+ * then.  What a crash leaves, the startup removes with the other layers not
+ * in the stack.
  */
 static void
-ps_remove_unlisted_layers(bool wait)
+ps_trash_layer(uint32 gen)
+{
+	char		dir[MAXPGPATH];
+	char		trash[MAXPGPATH];
+
+	ps_layer_path(dir, gen);
+	snprintf(trash, sizeof(trash), "%s.trash", dir);
+	if (rename(dir, trash) < 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not rename directory \"%s\" to \"%s\": %m",
+						dir, trash)));
+}
+
+static void
+ps_empty_trash(void)
 {
 	DIR		   *dirdesc;
 	struct dirent *de;
-	uint32		unlisted[PAGESTORE_MAX_LAYERS];
-	int			nunlisted = 0;
+	bool		removed = false;
+
+	/* one process at a time, or they trip over each other's removals */
+	if (!pg_atomic_test_set_flag(&PsCtl->trash_emptying))
+		return;
+
+	dirdesc = AllocateDir(PAGESTORE_DIR);
+	while ((de = ReadDir(dirdesc, PAGESTORE_DIR)) != NULL)
+	{
+		size_t		len = strlen(de->d_name);
+		char		path[MAXPGPATH];
+
+		if (len <= 6 || strcmp(de->d_name + len - 6, ".trash") != 0)
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", PAGESTORE_DIR, de->d_name);
+		if (!rmtree(path, true))
+			ereport(WARNING,
+					(errmsg("could not remove directory \"%s\"", path)));
+		removed = true;
+	}
+	FreeDir(dirdesc);
+	if (removed)
+		fsync_fname(PAGESTORE_DIR, true);
+
+	pg_atomic_clear_flag(&PsCtl->trash_emptying);
+}
+
+/*
+ * Find layer directories that the stack doesn't list, while the server runs:
+ * what a merge that failed after putting its merged layer in the stack left,
+ * or one that failed or gave way to a clone before.  Found under the branch
+ * lock, so no freeze is making a directory for a layer not yet in the stack,
+ * and with reclaim_running held, so no merge is making one.  Generations
+ * never repeat, so nothing new can take their names.  Adds them to gone, to
+ * be removed once every backend has closed its files: see ps_remove_layers().
+ */
+static void
+ps_find_unlisted_layers(bool wait, uint32 *gone, int *ngone)
+{
+	DIR		   *dirdesc;
+	struct dirent *de;
 
 	if (wait)
 		LWLockAcquire(&PsCtl->branch_lock, LW_EXCLUSIVE);
@@ -4092,7 +4717,7 @@ ps_remove_unlisted_layers(bool wait)
 
 	dirdesc = AllocateDir(PAGESTORE_DIR);
 	while ((de = ReadDir(dirdesc, PAGESTORE_DIR)) != NULL &&
-		   nunlisted < PAGESTORE_MAX_LAYERS)
+		   *ngone < PAGESTORE_MAX_LAYERS)
 	{
 		char	   *end;
 		unsigned long gen;
@@ -4107,26 +4732,29 @@ ps_remove_unlisted_layers(bool wait)
 			listed |= PsCtl->layers[i] == gen;
 		LWLockRelease(&PsCtl->partition_locks[0].lock);
 		if (!listed)
-			unlisted[nunlisted++] = (uint32) gen;
+			gone[(*ngone)++] = (uint32) gen;
 	}
 	FreeDir(dirdesc);
 	LWLockRelease(&PsCtl->branch_lock);
+}
 
-	if (nunlisted == 0)
-		return;
-
-	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
-	for (int i = 0; i < nunlisted; i++)
+/*
+ * Remove layers taken off the stack, once every backend has closed its files
+ * of them.  Called without reclaim_running: the wait for the backends can
+ * take as long as a checkpoint, which the checkpointer finishes before
+ * closing its files, and a clone may be waiting for the flag.
+ */
+static void
+ps_remove_layers(const uint32 *gone, int ngone)
+{
+	if (ngone > 0)
 	{
-		char		dir[MAXPGPATH];
-
-		ps_layer_path(dir, unlisted[i]);
-		if (!rmtree(dir, true))
-			ereport(WARNING,
-					(errmsg("could not remove directory \"%s\"", dir)));
-		ps_forget_layer(unlisted[i]);
+		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+		for (int i = 0; i < ngone; i++)
+			ps_trash_layer(gone[i]);
+		fsync_fname(PAGESTORE_DIR, true);
 	}
-	fsync_fname(PAGESTORE_DIR, true);
+	ps_empty_trash();
 }
 
 /*
@@ -4134,14 +4762,14 @@ ps_remove_unlisted_layers(bool wait)
  * max_frozen of them.  Returns false if there were not.
  */
 static bool
-ps_merge_once(int max_frozen, bool wait, PageStoreMergeResult *result)
+ps_merge_once(int max_frozen, bool wait, PageStoreMergeResult *result,
+			  bool *yielded, uint32 *gone, int *ngone)
 {
 	uint32		layers[PAGESTORE_MAX_LAYERS];
 	int			nlayers;
 	int			best = -1;
 	int64		best_cost = PG_INT64_MAX;
 	uint32		newgen;
-	uint32		gone[2];
 	bool		swapped = false;
 
 	/* The frozen layers, which are durable once pg_branch() is done */
@@ -4162,8 +4790,11 @@ ps_merge_once(int max_frozen, bool wait, PageStoreMergeResult *result)
 
 	for (int i = 0; i + 1 < nlayers; i++)
 	{
-		int64		cost = ps_pair_cost(layers[i], layers[i + 1]);
+		int64		cost = ps_pair_cost(layers[i], layers[i + 1], !wait,
+										yielded);
 
+		if (*yielded)
+			return false;
 		if (cost < best_cost)
 		{
 			best = i;
@@ -4172,7 +4803,15 @@ ps_merge_once(int max_frozen, bool wait, PageStoreMergeResult *result)
 	}
 
 	result->written_bytes += ps_merge_pair(layers[best], layers[best + 1],
-										   newgen);
+										   newgen, !wait, yielded);
+
+	/*
+	 * A clone waits: leave the pair for next time, and the merged layer,
+	 * which isn't in the stack, for the next merge to remove.  Removing it
+	 * now could keep the clone waiting.
+	 */
+	if (*yielded)
+		return false;
 
 	/* Put the merged layer in the pair's place */
 	LWLockAcquire(&PsCtl->branch_lock, LW_EXCLUSIVE);
@@ -4205,22 +4844,13 @@ ps_merge_once(int max_frozen, bool wait, PageStoreMergeResult *result)
 		elog(ERROR, "page store layers %u and %u are no longer adjacent",
 			 layers[best], layers[best + 1]);
 
-	/* No backend reads the pair any more once all have closed their files */
-	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
-
-	gone[0] = layers[best];
-	gone[1] = layers[best + 1];
-	for (int i = 0; i < 2; i++)
+	/* Removed once no backend reads the pair any more, see ps_remove_layers() */
+	for (int i = best; i <= best + 1; i++)
 	{
-		char		dir[MAXPGPATH];
-
-		ps_layer_path(dir, gone[i]);
-		if (!rmtree(dir, true))
-			ereport(WARNING,
-					(errmsg("could not remove directory \"%s\"", dir)));
-		ps_forget_layer(gone[i]);
+		if (*ngone < PAGESTORE_MAX_LAYERS * 2)
+			gone[(*ngone)++] = layers[i];
+		ps_forget_layer(layers[i]);
 	}
-	fsync_fname(PAGESTORE_DIR, true);
 
 	result->merged_layers++;
 	return true;
@@ -4236,6 +4866,9 @@ PageStoreMerge(int max_frozen, bool wait, PageStoreMergeResult *result)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
+	bool		yielded = false;
+	uint32		gone[PAGESTORE_MAX_LAYERS * 2];
+	int			ngone = 0;
 
 	memset(result, 0, sizeof(PageStoreMergeResult));
 
@@ -4256,12 +4889,15 @@ PageStoreMerge(int max_frozen, bool wait, PageStoreMergeResult *result)
 	PG_ENSURE_ERROR_CLEANUP(ps_reclaim_cleanup, (Datum) 0);
 	{
 		ps_forget_all_layers();
-		ps_remove_unlisted_layers(wait);
-		while (ps_merge_once(Max(max_frozen, 1), wait, result))
+		ps_find_unlisted_layers(wait, gone, &ngone);
+		while (ps_merge_once(Max(max_frozen, 1), wait, result, &yielded,
+							 gone, &ngone))
 			MemoryContextReset(cxt);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(ps_reclaim_cleanup, (Datum) 0);
 	pg_atomic_clear_flag(&PsCtl->reclaim_running);
+
+	ps_remove_layers(gone, ngone);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
