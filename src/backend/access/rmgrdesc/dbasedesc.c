@@ -24,7 +24,8 @@ dbase_desc(StringInfo buf, XLogReaderState *record)
 	char	   *rec = XLogRecGetData(record);
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	if (info == XLOG_DBASE_CREATE_FILE_COPY)
+	if (info == XLOG_DBASE_CREATE_FILE_COPY ||
+		info == XLOG_DBASE_CREATE_SNAPSHOT)
 	{
 		xl_dbase_create_file_copy_rec *xlrec =
 			(xl_dbase_create_file_copy_rec *) rec;
@@ -68,6 +69,9 @@ dbase_identify(uint8 info)
 			break;
 		case XLOG_DBASE_DROP:
 			id = "DROP";
+			break;
+		case XLOG_DBASE_CREATE_SNAPSHOT:
+			id = "CREATE_SNAPSHOT";
 			break;
 	}
 

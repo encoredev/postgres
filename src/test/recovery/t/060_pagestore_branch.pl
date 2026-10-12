@@ -270,7 +270,14 @@ check_r($keep, 'a', 'branch sharing reclaimed layers');
 is($keep->safe_psql('postgres', 'SELECT count(*) FROM gone'),
 	'50000', 'branch keeps a table the source dropped and reclaimed');
 
+# The dropped table's files are gone, so the map saying it was dropped
+# hides nothing any more, and the next pass removes it
 my ($files2, $layers2, $bytes2) = reclaim($rc);
+ok($files2 > 0, "reclaiming again removes the dropped table's map ($files2)");
+check_r($rc, 'b', 'source after reclaiming the map');
+is($keep->safe_psql('postgres', 'SELECT count(*) FROM gone'),
+	'50000', 'branch keeps the table after the map went');
+($files2, $layers2, $bytes2) = reclaim($rc);
 is($files2, '0', 'reclaiming again finds nothing more');
 
 # With the branch gone, nothing shares the hidden blocks any more

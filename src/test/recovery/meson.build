@@ -68,6 +68,7 @@ tests += {
       't/057_snapshot_commit_race.pl',
       't/059_remote_apply_status_interval.pl',
       't/060_pagestore_branch.pl',
+      't/061_pagestore_snapshot_database.pl',
     ],
   },
 }

@@ -2432,8 +2432,12 @@ PsForkKind
 PsFrozenFork
 PsFrozenKey
 PsMapHeader
+PsMergedFork
 PsOpenFile
+PsPairFiles
 PsShared
+PsSnapshotLink
+PsSnapshotState
 PsTopFork
 PsqlScanCallbacks
 PsqlScanQuoteType

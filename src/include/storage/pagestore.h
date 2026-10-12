@@ -98,6 +98,10 @@ extern void PageStoreResetUnloggedRelations(int op);
 extern int64 PageStoreForkSize(RelFileLocator rlocator, ForkNumber forknum);
 extern int64 PageStoreDatabaseSize(Oid dbid);
 extern bool PageStoreRelFileNumberInUse(RelFileLocator rlocator);
+extern bool PageStoreDatabaseInUse(Oid dbid);
+
+/* support for CREATE DATABASE ... STRATEGY SNAPSHOT */
+extern void PageStoreSnapshotDatabase(Oid src_dbid, Oid dst_dbid);
 
 /* support for pg_branch() */
 extern int	PageStoreFreeze(uint32 *layers, XLogRecPtr *insert_end);
