@@ -2532,6 +2532,28 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-pagestore-auto-freeze" xreflabel="pagestore_auto_freeze">
+      <term><varname>pagestore_auto_freeze</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>pagestore_auto_freeze</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Makes the page store merger freeze the page store's top layer, as
+        <function>pg_pagestore_freeze</function> does, once 75% of
+        <xref linkend="guc-pagestore-max-forks"/> or of
+        <xref linkend="guc-pagestore-max-bitmap-chunks"/> is in use, which
+        frees them again.  Without it, writes and
+        <command>CREATE DATABASE</command> fail once they run out.  Each
+        freeze adds a frozen layer, which merging folds in later.  The
+        default is <literal>on</literal>.  This parameter can only be set in
+        the <filename>postgresql.conf</filename> file or on the server
+        command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-pagestore-max-forks" xreflabel="pagestore_max_forks">
       <term><varname>pagestore_max_forks</varname> (<type>integer</type>)
       <indexterm>
@@ -2559,8 +2581,9 @@ include_dir 'conf.d'
        <para>
         Sets the number of 1 kB bitmap chunks the page store can use to track
         which blocks of relations shared with frozen layers have been written
-        to since.  Each chunk covers 8192 blocks of one relation fork.  The
-        default is 16384.  This parameter can only be set at server start,
+        to since.  Each chunk covers 8192 blocks of one relation fork; forks
+        of at most 256 blocks, as most are, need none.  The default is
+        16384.  This parameter can only be set at server start,
         and only takes memory in a cluster that uses the page store.
        </para>
       </listitem>

@@ -39,6 +39,7 @@ extern PGDLLIMPORT int pagestore_max_forks;
 extern PGDLLIMPORT int pagestore_max_bitmap_chunks;
 extern PGDLLIMPORT bool pagestore_reclaim;
 extern PGDLLIMPORT int pagestore_max_frozen_layers;
+extern PGDLLIMPORT bool pagestore_auto_freeze;
 
 /* What PageStoreReclaim() gave back */
 typedef struct PageStoreReclaimResult
