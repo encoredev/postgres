@@ -361,3 +361,15 @@ PG_TEST_INITDB_EXTRA_OPTS=--pagestore make check
 - `061_pagestore_snapshot_database.pl`: cloning databases, crash recovery and
   replay of a clone, merging and dropping clones.
 - `062_pagestore_limits.pl`: full tables, freezing, automatic freezing.
+
+### The build Encore bundles
+
+`encore/dist.sh <output dir>` uses meson to build the server, the client
+programs and contrib into a directory that runs from wherever it's moved to.
+It then checks a copy of that directory by initializing a page store cluster
+and cloning a database. It builds for darwin-arm64, darwin-amd64 (on an Apple
+Silicon Mac), linux-amd64, linux-arm64 and windows-amd64; the script lists
+what each needs. The Linux builds are made in a `manylinux_2_28` container,
+so they run on glibc 2.28 and later. Encore's releaser runs the script for
+each platform and publishes the results, as `cmd/postgres` in
+`encoredev/releaser` describes.
