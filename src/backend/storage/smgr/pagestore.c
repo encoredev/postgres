@@ -3796,6 +3796,20 @@ ps_frozen_holds(const PsFrozenFork *f, uint64 blkno)
 	return blkno >= f->base || ps_frozen_bit(f, (BlockNumber) blkno);
 }
 
+/*
+ * The bytes a file takes on disk. Windows' stat() has no st_blocks, and holes
+ * aren't punched there, so a file takes its size.
+ */
+static inline int64
+ps_stat_allocated(const struct stat *st)
+{
+#ifdef WIN32
+	return (int64) st->st_size;
+#else
+	return (int64) st->st_blocks * 512;
+#endif
+}
+
 static int
 ps_punch_hole(int fd, off_t offset, off_t len)
 {
@@ -3826,7 +3840,7 @@ ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
 {
 	char		path[MAXPGPATH];
 	struct stat st;
-	blkcnt_t	before;
+	int64		before;
 	size_t		nwords = ps_bitmap_words(nblocks);
 	bool		shared;
 	int			fd;
@@ -3845,7 +3859,7 @@ ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not stat file \"%s\": %m", path)));
-	before = st.st_blocks;
+	before = ps_stat_allocated(&st);
 	shared = st.st_nlink != 1;
 
 #define PS_PUNCHABLE(b) \
@@ -3903,8 +3917,8 @@ ps_punch_blocks(uint32 gen, const PsForkKey *key, const uint32 *unwritten,
 	}
 #undef PS_PUNCHABLE
 
-	if (fstat(fd, &st) == 0 && st.st_blocks < before)
-		result->reclaimed_bytes += (int64) (before - st.st_blocks) * 512;
+	if (fstat(fd, &st) == 0 && ps_stat_allocated(&st) < before)
+		result->reclaimed_bytes += before - ps_stat_allocated(&st);
 	CloseTransientFile(fd);
 }
 
@@ -4064,7 +4078,7 @@ ps_unlink_dead_file(const char *path, PageStoreReclaimResult *result)
 	}
 	result->removed_files++;
 	if (st.st_nlink == 1)
-		result->reclaimed_bytes += (int64) st.st_blocks * 512;
+		result->reclaimed_bytes += ps_stat_allocated(&st);
 }
 
 static bool
@@ -4553,7 +4567,7 @@ ps_allocated_bytes(uint32 gen, const PsForkKey *key)
 	ps_data_path(path, gen, key);
 	if (stat(path, &st) < 0)
 		return 0;
-	return (int64) st.st_blocks * 512;
+	return ps_stat_allocated(&st);
 }
 
 /* The forks with files in either of two frozen layers */
