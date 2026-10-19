@@ -14,14 +14,22 @@
 #   catalog_version  CATALOG_VERSION_NO; data directories of another catalog
 #                    version don't start
 #   commit           the commit built
+#   <library>        the version of each library encore/deps.sh built, as in
+#                    openssl=3.5.9
+#
+# The build has the extensions of contrib and pgvector (contrib/vector), and
+# OpenSSL, libxml2, libxslt, lz4, zstd, ICU and libuuid, which
+# encore/deps.sh builds and the output includes.  The extensions that
+# Encore's Docker image made trusted, which users other than superusers may
+# create, are trusted here too.
 #
 # Unless given --no-check, a copy of the output in another directory
-# initializes a page store cluster and clones a database in it; for
-# darwin-amd64 on Apple Silicon, only where Rosetta runs it.
+# initializes a page store cluster, clones a database in it and creates every
+# extension; for darwin-amd64 on Apple Silicon, only where Rosetta runs it.
 #
-# Needs meson, ninja, bison, flex and perl; patchelf on Linux; on Windows,
-# Git Bash with the MSVC environment set up (vcvarsall, or
-# msvc-dev-cmd in GitHub Actions).
+# Needs meson, ninja, bison, flex, perl, pkg-config and what encore/deps.sh
+# needs; patchelf on Linux; on Windows, Git Bash with the MSVC environment set
+# up (vcvarsall, or msvc-dev-cmd in GitHub Actions).
 set -euo pipefail
 
 usage() {
@@ -105,13 +113,26 @@ native() {
 prefix=$build/install/pgsql
 rm -rf "$build/install"
 
+# The libraries Postgres links with beyond the system's, which it finds
+# through their pkg-config files
+deps=$build/deps
+"$src/encore/deps.sh" --target "$target" --work-dir "$build/deps.work" "$deps"
+
 opts=(
 	--buildtype=release
 	--prefix="$(native "$prefix")"
 	--libdir=lib
+	--pkg-config-path="$(native "$deps/lib/pkgconfig")"
 	-Dauto_features=disabled
 	-Drpath=false
 	-Dtap_tests=disabled
+	-Dssl=openssl
+	-Dlibxml=enabled
+	-Dlibxslt=enabled
+	-Dlz4=enabled
+	-Dzstd=enabled
+	-Dicu=enabled
+	-Duuid=e2fs
 )
 case $os in
 	darwin)
@@ -132,6 +153,7 @@ if [ -n "$cross" ]; then
 		c = ['clang', '-arch', 'x86_64']
 		ar = 'ar'
 		strip = 'strip'
+		pkg-config = 'pkg-config'
 
 		[host_machine]
 		system = 'darwin'
@@ -175,21 +197,53 @@ rm -f "$out"/bin/ecpg* "$out"/lib/libecpg* "$out"/lib/libpgtypes* \
 rm -f "$out/lib/libpq.dylib" "$out/lib/libpq.so"
 find "$out" \( -name '*.a' -o -name '*.lib' -o -name '*.pdb' \) -delete
 
-# Strip, and make what refers to the install's libraries look for them
-# relative to itself
+# The libraries deps.sh built, each under the name it's loaded by.  libexslt
+# and ICU's libraries for its tools and tests are built but not used.
+unused() {
+	case $1 in *exslt*|*icutu*|*icutest*|*icuio*) return 0 ;; esac
+	return 1
+}
+case $os in
+	darwin)
+		for f in "$deps"/lib/*.dylib; do
+			[ -L "$f" ] && continue
+			name=$(basename "$(otool -D "$f" | awk 'NR == 2')")
+			unused "$name" || cp "$f" "$out/lib/$name"
+		done
+		;;
+	linux)
+		for f in "$deps"/lib/*.so*; do
+			[ -L "$f" ] && continue
+			name=$(patchelf --print-soname "$f")
+			unused "$name" || cp "$f" "$out/lib/$name"
+		done
+		;;
+	windows)
+		for f in "$deps"/bin/*.dll; do
+			unused "$(basename "$f")" || cp "$f" "$out/bin/"
+		done
+		;;
+esac
+
+# Strip, and make what refers to the output's libraries look for them
+# relative to itself.  Then check that nothing refers to a library that's
+# neither in the output nor the system's.
 case $os in
 	darwin)
 		relocate() {
 			local f=$1 dir=$2 id
 
 			strip -x "$f"
-			otool -L "$f" | awk -v lib="$prefix/lib/" 'NR > 1 && index($1, lib) == 1 {print $1}' |
+			otool -L "$f" | awk 'NR > 1 {print $1}' |
 				while read -r dep; do
-					install_name_tool -change "$dep" "$dir/$(basename "$dep")" "$f" 2>/dev/null
+					case $dep in @executable_path/*|@loader_path/*|/usr/lib/*|/System/*) continue ;; esac
+					[ -e "$out/lib/$(basename "$dep")" ] &&
+						install_name_tool -change "$dep" "$dir/$(basename "$dep")" "$f" 2>/dev/null
 				done
 			id=$(otool -D "$f" | awk 'NR > 1')
 			case $id in
-				"$prefix"/lib/*) install_name_tool -id "@rpath/$(basename "$id")" "$f" 2>/dev/null ;;
+				''|@rpath/*) ;;
+				*) install_name_tool -id "@rpath/$(basename "$id")" "$f" 2>/dev/null ;;
 			esac
 			# Changing a binary invalidates its signature, which arm64 requires
 			codesign -s - -f "$f" 2>/dev/null
@@ -200,7 +254,24 @@ case $os in
 		for f in "$out"/lib/*.dylib; do
 			[ -L "$f" ] || relocate "$f" @loader_path
 		done
-		left=$(find "$out/bin" "$out/lib" -type f -exec otool -L {} + | grep -F "$prefix/" || true)
+		# A function, as bash 3.2 can't parse a case in $(...)
+		unresolved() {
+			local f id dep
+			for f in "$out"/bin/* "$out"/lib/*.dylib; do
+				[ -L "$f" ] && continue
+				id=$(otool -D "$f" | awk 'NR > 1')
+				otool -L "$f" | awk -v id="$id" 'NR > 1 && $1 != id {print $1}' |
+					while read -r dep; do
+						case $dep in
+							/usr/lib/*|/System/*) ;;
+							@executable_path/../lib/*|@loader_path/*)
+								[ -e "$out/lib/${dep##*/}" ] || echo "$dep" ;;
+							*) echo "$dep" ;;
+						esac
+					done
+			done
+		}
+		left=$(unresolved)
 		;;
 	linux)
 		for f in "$out"/bin/* "$out"/lib/*.so*; do
@@ -211,9 +282,16 @@ case $os in
 				*) patchelf --set-rpath '$ORIGIN' "$f" ;;
 			esac
 		done
+		# What the manylinux policy lets a program take from the system,
+		# which glibc 2.28 and later has
+		system='^(libc|libm|libdl|libpthread|librt|libz|libstdc\+\+|libgcc_s|ld-linux-.*)\.so'
 		left=$(for f in "$out"/bin/* "$out"/lib/*.so*; do
-			[ -L "$f" ] || patchelf --print-rpath "$f"
-		done | grep -F "$prefix" || true)
+			[ -L "$f" ] && continue
+			patchelf --print-rpath "$f" | grep -F "$prefix" || true
+			patchelf --print-needed "$f" | while read -r lib; do
+				[ -e "$out/lib/$lib" ] || echo "$lib" | grep -Ev "$system" || true
+			done
+		done)
 		;;
 	windows)
 		# DLLs sit beside the programs, and modules are loaded by path
@@ -221,10 +299,28 @@ case $os in
 		;;
 esac
 if [ -n "$left" ]; then
-	echo "the output still loads libraries from $prefix:" >&2
-	echo "$left" >&2
+	echo "the output loads libraries that aren't in it:" >&2
+	echo "$left" | sort -u >&2
 	exit 1
 fi
+
+# Trusted, as Encore's Docker image made them, so that a database's owner
+# may create them without being a superuser
+trusted=(amcheck autoinc bloom btree_gin btree_gist citext cube dblink dict_int
+	dict_xsyn earthdistance fuzzystrmatch hstore insert_username intagg intarray
+	isn lo ltree moddatetime pageinspect pg_buffercache pg_freespacemap pg_prewarm
+	pg_stat_statements pg_trgm pg_visibility pgcrypto pgrowlocks pgstattuple
+	plpgsql postgres_fdw refint seg sslinfo tablefunc tsm_system_rows
+	tsm_system_time unaccent uuid-ossp vector)
+for ext in "${trusted[@]}"; do
+	control=$out/share/extension/$ext.control
+	if [ ! -f "$control" ]; then
+		echo "the build has no extension $ext" >&2
+		exit 1
+	fi
+	grep -Eq '^[[:space:]]*trusted[[:space:]]*=[[:space:]]*true' "$control" ||
+		echo 'trusted = true' >>"$control"
+done
 
 cat >"$out/VERSION" <<EOF
 version=$version
@@ -232,6 +328,9 @@ pg_version=$pg_version
 catalog_version=$catalog_version
 commit=$commit
 EOF
+for f in "$deps"/.built/*; do
+	echo "$(basename "$f")=$(awk '{print $1}' "$f")" >>"$out/VERSION"
+done
 
 if [ -n "$check" ] && [ -n "$cross" ] && ! "$out/bin/postgres" --version >/dev/null 2>&1; then
 	echo "not checking the $target build, which this machine can't run"
@@ -254,15 +353,46 @@ if [ -n "$check" ]; then
 	fi
 	pg_ctl -D "$(native "$tmp/data")" -l "$(native "$tmp/server.log")" -o "$server_opts" -w start >/dev/null ||
 		{ cat "$tmp/server.log" >&2; exit 1; }
-	sql() { psql "${conn[@]}" -U postgres -X -A -t -v ON_ERROR_STOP=1 -d "$1" -c "$2" | tr -d '\r'; }
+	# The SQL on stdin, which Git Bash passes on unchanged
+	sql_as() { echo "$3" | psql "${conn[@]}" -U "$1" -X -q -A -t -v ON_ERROR_STOP=1 -d "$2" -f - | tr -d '\r'; }
+	sql() { sql_as postgres "$@"; }
+	expect() {
+		local got
+		got=$(sql "$1" "$2")
+		[ "$got" = "$3" ] || { echo "$2: got '$got', not '$3'" >&2; exit 1; }
+	}
 	sql postgres "CREATE DATABASE tmpl" >/dev/null
 	sql tmpl "CREATE EXTENSION pg_trgm; CREATE TABLE t AS SELECT g AS a FROM generate_series(1, 10000) g" >/dev/null
 	sql postgres "SELECT pg_pagestore_freeze('tmpl')" >/dev/null
 	sql postgres "CREATE DATABASE c TEMPLATE tmpl STRATEGY = SNAPSHOT" >/dev/null
 	got=$(sql c "SELECT count(*) FROM t WHERE similarity(a::text, '42') >= 0")
 	[ "$got" = 10000 ] || { echo "the clone has $got rows, not 10000" >&2; exit 1; }
+
+	# Every extension, which loads its module and what that links with: the
+	# trusted ones as a database's owner who isn't a superuser, the others
+	# as a superuser.  In UTF-8, for ICU, whatever the machine's locale is.
+	sql postgres "CREATE ROLE owner LOGIN" >/dev/null
+	sql postgres "CREATE DATABASE exts OWNER owner TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'" >/dev/null
+	for ext in "${trusted[@]}"; do
+		sql_as owner exts "CREATE EXTENSION IF NOT EXISTS \"$ext\" CASCADE" >/dev/null
+	done
+	for control in "$tmp"/pgsql/share/extension/*.control; do
+		ext=$(basename "$control" .control)
+		sql exts "CREATE EXTENSION IF NOT EXISTS \"$ext\" CASCADE" >/dev/null
+	done
+	# And each library deps.sh built
+	expect exts "SELECT encode(digest('abc', 'sha256'), 'hex')" \
+		ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+	expect exts "SELECT ssl_is_used()" f
+	expect exts "SELECT substr(uuid_generate_v1()::text, 15, 1) || substr(uuid_generate_v4()::text, 15, 1)" 14
+	expect exts "SELECT '[1,2,3]'::vector <-> '[1,2,5]'" 2
+	expect exts "SELECT (xpath('/a/text()', '<a>x</a>'))[1]" x
+	expect exts "SELECT xslt_process('<a>x</a>', '<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:output method=\"text\"/><xsl:template match=\"/\">y<xsl:value-of select=\"a\"/></xsl:template></xsl:stylesheet>')" yx
+	expect exts "SELECT 'a' < 'B' COLLATE \"und-x-icu\", 'a' < 'B' COLLATE \"C\"" "t|f"
+	expect exts "CREATE TABLE z (t text COMPRESSION lz4); INSERT INTO z VALUES (repeat('x', 100000)); SELECT pg_column_compression(t) FROM z" lz4
+	expect exts "SET wal_compression = zstd; SHOW wal_compression" zstd
 	pg_ctl -D "$(native "$tmp/data")" -m fast -w stop >/dev/null
-	echo "checked: initdb --pagestore, a contrib module, freezing and STRATEGY = SNAPSHOT from $tmp/pgsql"
+	echo "checked: initdb --pagestore, freezing and STRATEGY = SNAPSHOT, and every extension from $tmp/pgsql"
 fi
 
 echo "built $version for $target in $out"
