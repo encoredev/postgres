@@ -28,8 +28,9 @@
 # extension; for darwin-amd64 on Apple Silicon, only where Rosetta runs it.
 #
 # Needs meson, ninja, bison, flex, perl, pkg-config and what encore/deps.sh
-# needs; patchelf on Linux; on Windows, Git Bash with the MSVC environment set
-# up (vcvarsall, or msvc-dev-cmd in GitHub Actions).
+# needs; patchelf on Linux; on Windows, pkgconf rather than another
+# pkg-config, and Git Bash with the MSVC environment set up (vcvarsall, or
+# msvc-dev-cmd in GitHub Actions).
 set -euo pipefail
 
 usage() {
@@ -176,6 +177,11 @@ if [ "$os" = windows ]; then
 		awk '/^(\/[a-z]\/Program Files\/Git)?(\/usr)?\/bin$|\/mingw64\/bin$|^\/usr\/local\/bin$/ {tail = tail ":" $0; next}
 			{head = head (head ? ":" : "") $0}
 			END {print head tail}')
+	# Strawberry Perl's pkg-config.bat comes first in PATH too; meson
+	# rejects it and then looks no further
+	pkgconf=$(PATH=$meson_path command -v pkgconf) ||
+		{ echo "pkgconf is missing" >&2; exit 1; }
+	export PKG_CONFIG=$(cygpath -m "$pkgconf")
 fi
 
 if [ -f "$build/meson/build.ninja" ]; then
