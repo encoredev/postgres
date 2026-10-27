@@ -4121,7 +4121,8 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 /*
  * PostgresSingleUserMain
  *     Entry point for single user mode. argc/argv are the command line
- *     arguments to be used.
+ *     arguments to be used.  username is the effective user's name, the
+ *     default database name, or NULL if the user has none.
  *
  * Performs single user specific setup then calls PostgresMain() to actually
  * process queries. Single user mode specific setup should go here, rather
@@ -4281,7 +4282,8 @@ PostgresMain(const char *dbname, const char *username)
 	volatile bool idle_session_timeout_enabled = false;
 
 	Assert(dbname != NULL);
-	Assert(username != NULL);
+	/* a standalone backend's user may have no name; it's unused there */
+	Assert(username != NULL || !IsUnderPostmaster);
 
 	Assert(GetProcessingMode() == InitProcessing);
 
