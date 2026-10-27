@@ -270,7 +270,7 @@ static bool guc_value_requires_quotes(const char *guc_value);
 static char **readfile(const char *path);
 static void writefile(char *path, char **lines);
 static FILE *popen_check(const char *command, const char *mode);
-static char *get_id(void);
+static char *get_id(bool name_required);
 static int	get_encoding_id(const char *encoding_name);
 static void set_input(char **dest, const char *filename);
 static void check_input(char *path);
@@ -804,11 +804,16 @@ cleanup_directories_atexit(void)
  * find the current user
  *
  * on unix make sure it isn't root
+ *
+ * The name is needed only as the default superuser name.  Unless
+ * name_required, return NULL if the effective user has none, as when a
+ * container runs as a user ID without a passwd entry.
  */
 static char *
-get_id(void)
+get_id(bool name_required)
 {
 	const char *username;
+	char	   *errstr;
 
 #ifndef WIN32
 	if (geteuid() == 0)			/* 0 is root's uid */
@@ -819,9 +824,18 @@ get_id(void)
 	}
 #endif
 
-	username = get_user_name_or_exit(progname);
+	username = get_user_name(&errstr);
+	if (username)
+		return pg_strdup(username);
 
-	return pg_strdup(username);
+#ifndef WIN32
+	if (!name_required)
+		return NULL;
+#endif
+
+	pg_log_error("%s", errstr);
+	pg_log_error_hint("Specify the database superuser name with -U.");
+	exit(1);
 }
 
 static char *
@@ -3514,17 +3528,25 @@ main(int argc, char *argv[])
 
 	setup_bin_paths(argv[0]);
 
-	effective_user = get_id();
+	effective_user = get_id(username == NULL);
 	if (!username)
 		username = effective_user;
 
 	if (strncmp(username, "pg_", 3) == 0)
 		pg_fatal("superuser name \"%s\" is disallowed; role names cannot begin with \"pg_\"", username);
 
-	printf(_("The files belonging to this database system will be owned "
-			 "by user \"%s\".\n"
-			 "This user must also own the server process.\n\n"),
-		   effective_user);
+	if (effective_user)
+		printf(_("The files belonging to this database system will be owned "
+				 "by user \"%s\".\n"
+				 "This user must also own the server process.\n\n"),
+			   effective_user);
+#ifndef WIN32
+	else
+		printf(_("The files belonging to this database system will be owned "
+				 "by user ID %ld.\n"
+				 "This user must also own the server process.\n\n"),
+			   (long) geteuid());
+#endif
 
 	set_info_version();
 
