@@ -220,8 +220,18 @@ main(int argc, char *argv[])
 			GucInfoMain();
 			break;
 		case DISPATCH_SINGLE:
-			PostgresSingleUserMain(argc, argv,
-								   strdup(get_user_name_or_exit(progname)));
+			{
+				/*
+				 * The user name is only the default database name, so an
+				 * effective user without one, as when a container runs as a
+				 * user ID without a passwd entry, may still name the database.
+				 */
+				char	   *errstr;
+				const char *user_name = get_user_name(&errstr);
+
+				PostgresSingleUserMain(argc, argv,
+									   user_name ? strdup(user_name) : NULL);
+			}
 			break;
 		case DISPATCH_POSTMASTER:
 			PostmasterMain(argc, argv);
